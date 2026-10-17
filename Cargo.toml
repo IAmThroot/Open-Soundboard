@@ -1,0 +1,37 @@
+[package]
+name = "open-soundboard"
+version = "0.1.0"
+edition = "2021"
+description = "A dead-simple soundboard for non-tech-savvy users"
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+eframe = "0.37"
+egui = "0.37"
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+rodio = "0.23"
+cpal = "0.18"
+rfd = "0.17"
+crossbeam-channel = "0.5"
+global-hotkey = "0.8"
+directories = "6"
+serde_json = "1"
+hound = "3"
+
+# Win32 message pump for the hotkey thread (see src/hotkey.rs).
+# Version aligned with global-hotkey 0.8's own windows-sys.
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+
+[build-dependencies]
+embed-resource = "3"

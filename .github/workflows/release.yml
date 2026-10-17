@@ -1,0 +1,110 @@
+name: Release
+
+# Tag a version (v0.1.0) to build the Windows installer and the portable zip
+# and attach them to a GitHub release. Also runnable manually (workflow_dispatch)
+# as a dry run: artifacts are uploaded, but no release is created.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: build installer + portable
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $isccPath = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          if (!(Test-Path $isccPath)) {
+            $isccPath = "$env:ProgramFiles\Inno Setup 6"
+          }
+          Write-Host "Adding $isccPath to PATH"
+          echo $isccPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # MSVC build: this is the binary users get. embed-resource finds the
+      # toolchain's resource compiler here, so the icon is embedded in the
+      # .exe itself (not just on shortcuts).
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Read version
+        shell: pwsh
+        run: |
+          $toml = Get-Content Cargo.toml -Raw
+          if ($toml -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw "version not found in Cargo.toml" }
+          "APP_VERSION=$($Matches[1])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Building version $($Matches[1])"
+
+      - name: Compile installer
+        shell: pwsh
+        run: iscc "/DMyAppVersion=$env:APP_VERSION" packaging\installer.iss
+
+      - name: Stage portable zip
+        shell: pwsh
+        run: |
+          $stage = Join-Path "dist\portable" "OpenSoundboard-$env:APP_VERSION"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target\release\open-soundboard.exe" $stage
+          Copy-Item "README.md" $stage
+          Copy-Item "packaging\PORTABLE.txt" $stage
+          Compress-Archive -Force -Path $stage -DestinationPath "dist\OpenSoundboard-$env:APP_VERSION-portable.zip"
+
+      # A GUI app needs a desktop session; runners occasionally lack a usable
+      # one, so a failure here warns loudly instead of blocking the release.
+      - name: Smoke test the built binary
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # A release build that cannot even start is worse than no release.
+          # It opens a window, so run it briefly and require it to stay alive.
+          $p = Start-Process -FilePath "target\release\open-soundboard.exe" -PassThru
+          Start-Sleep -Seconds 6
+          if ($p.HasExited) { throw "the release binary exited immediately (code $($p.ExitCode))" }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "Release binary stayed alive."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenSoundboard-artifacts
+          path: |
+            dist/OpenSoundboard-Setup-*.exe
+            dist/OpenSoundboard-*-portable.zip
+          if-no-files-found: error
+
+      - name: Attach to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $setup = "dist\OpenSoundboard-Setup-$env:APP_VERSION.exe"
+          $portable = "dist\OpenSoundboard-$env:APP_VERSION-portable.zip"
+          
+          # Check if release exists (e.g. drafted or created via web UI)
+          $exists = gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; uploading assets..."
+            gh release upload $tag $setup $portable --clobber
+          } else {
+            Write-Host "Creating release $tag..."
+            gh release create $tag $setup $portable --title "Open Soundboard $env:APP_VERSION" --generate-notes
+          }

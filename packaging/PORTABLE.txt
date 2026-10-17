@@ -1,0 +1,26 @@
+Open Soundboard — portable notes
+================================
+
+Everything needed to run is in this folder: just double-click
+open-soundboard.exe. Nothing is installed, nothing is written to Program
+Files, and there is no uninstaller — delete the folder to remove the app.
+
+Where your stuff lives
+----------------------
+Your boards, sounds and microphone recordings are NOT inside this folder.
+They are stored per-user in:
+
+    %APPDATA%\OpenSoundboard\Open Soundboard\
+        config.json        (boards, hotkeys, volume, device choices)
+        data\recordings\   (microphone takes)
+
+Because that folder is separate from the app, you can move this portable
+folder anywhere, keep several copies, or upgrade by replacing the .exe — your
+sounds always stay put. Deleting this folder does not delete your soundboard.
+
+Notes
+-----
+* Hotkeys work while the window is minimized or closed to the system tray.
+  Turn on tray behavior with the ⚙ (Settings) button in the toolbar.
+* Windows may show a SmartScreen warning the first time you run an app that
+  was not installed from the Store. Choose "More info" → "Run anyway".
