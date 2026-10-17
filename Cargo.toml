@@ -1,10 +1,10 @@
 [package]
 name = "open-soundboard"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A dead-simple soundboard for non-tech-savvy users"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [dependencies]
 eframe = "0.37"

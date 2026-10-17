@@ -19,7 +19,7 @@ Designed for gamers, streamers, podcasters, and everyday users who want a soundb
 - **🎙 In-App Microphone Recording**  
   Record voice lines or sound effects directly from your microphone with one click. Recorded takes are automatically saved as 16-bit WAV files and added to your active board as sound tiles. Built with stream-death recovery and watchdog protection to ensure the recorder never wedges or hangs.
 - **🎚️ Device Routing & Master Controls**  
-  Select your audio output device on the fly—route clips through your headset for personal listening or through a virtual audio cable (like VB-Cable) to broadcast to voice chat. Features per-board and master volume sliders and a universal panic/stop hotkey (`Esc` by default).
+  Select your audio output device on the fly—route clips through your headset for personal listening or through a virtual audio cable (like VB-Cable) to broadcast to voice chat. Features a master volume slider and a universal panic/stop hotkey you can bind to any key.
 - ** System Tray Integration**  
   Keep your taskbar uncluttered. Enable "Close to Tray" in Settings so the app runs unobtrusively in the background while keeping all global hotkeys fully active.
 - ** Automatic Atomic Persistence**  
@@ -35,7 +35,7 @@ Open Soundboard runs on **64-bit Windows 10 and Windows 11**.
 
 ### Option 1: Windows Installer (Recommended)
 
-1. Download **`OpenSoundboard-Setup-0.1.0.exe`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
+1. Download **`OpenSoundboard-Setup-0.1.1.exe`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
 2. Run the installer.
    - **No Administrator Rights Required:** Open Soundboard installs cleanly per-user into `%LOCALAPPDATA%\Programs\Open Soundboard`.
    - Optionally check the box to create a Desktop shortcut.
@@ -45,7 +45,7 @@ Open Soundboard runs on **64-bit Windows 10 and Windows 11**.
 
 ### Option 2: Portable Zip
 
-1. Download **`OpenSoundboard-0.1.0-portable.zip`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
+1. Download **`OpenSoundboard-0.1.1-portable.zip`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
 2. Extract the folder anywhere on your computer (e.g., `Documents` or a USB flash drive).
 3. Double-click `open-soundboard.exe` to run. No files are written to `Program Files` or the Windows Registry.
 
@@ -55,7 +55,7 @@ Open Soundboard runs on **64-bit Windows 10 and Windows 11**.
 
 ## 🛠 Building from Source
 
-If you prefer building from source, you will need the Rust toolchain installed (Rust 1.85 or newer).
+If you prefer building from source, you will need the Rust toolchain installed (Rust 1.95 or newer).
 
 ```bash
 # Clone the repository
@@ -73,7 +73,7 @@ cargo run --release
 To compile the Windows installer locally, install [Inno Setup 6](https://jrsoftware.org/isdl.php) and run:
 ```powershell
 cargo build --release
-iscc /DMyAppVersion=0.1.0 packaging\installer.iss
+iscc /DMyAppVersion=0.1.1 packaging\installer.iss
 ```
 
 ---

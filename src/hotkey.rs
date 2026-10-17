@@ -1,35 +1,3 @@
-//! Phase 3: system-wide hotkeys.
-//!
-//! A dedicated thread owns the OS registration:
-//!
-//! ```text
-//! UI thread ──HotkeyCommand(Rebuild)──▶ hotkey thread ──OS grab──▶ Windows/etc.
-//!                                                    │
-//!                              global key press ─────┼──▶ AudioCommand::Play ──▶ audio thread
-//!                                                    │
-//!                              status problems ─────┴──▶ HotkeyEvent ──▶ UI thread
-//! ```
-//!
-//! Presses go **straight to the audio engine**, never through the UI — a busy
-//! or minimized window cannot delay or swallow a trigger. The UI only learns
-//! about presses indirectly via the audio engine's `Started` events (tile glow).
-//!
-//! Platform notes:
-//! - **Windows (the shipping target):** `RegisterHotKey` via a hidden window.
-//!   Works minimized, unfocused, and inside games/Discord. This is the real deal.
-//! - **Linux dev box:** `global-hotkey` talks X11. On a pure Wayland session
-//!   the manager or individual grabs fail, and we degrade to mouse-only
-//!   playback with an honest status-bar warning — never a crash, never silence
-//!   presented as success.
-//!
-//! Windows plumbing detail (this bit us once): the crate delivers presses as
-//! `WM_HOTKEY` window messages to a hidden window owned by *this* thread, and
-//! its docs require a win32 event loop on the thread that created the manager.
-//! This thread therefore pumps messages itself (see [`pump_win32_messages`]).
-//! Without the pump, `RegisterHotKey` succeeds yet presses queue forever —
-//! grabs registered, zero events, zero errors, exactly the silent failure we
-//! shipped in the first Phase-3 build.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -44,22 +12,15 @@ use log::{debug, info, warn};
 use crate::audio::{AudioCommand, TrimSpec};
 use crate::model::{Hotkey, SlotId};
 
-/// Reserved slot id for the global Stop key (it has no tile).
-/// Real slot ids count up from 1; `TEST_SOUND_ID` (`u64::MAX`, audio.rs) is the
-/// only other sentinel, so this cannot collide in practice.
 pub const STOP_ALL_ID: SlotId = SlotId::MAX - 1;
 
-/// What a grabbed key triggers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingAction {
-    /// Play one sound file.
     Play,
-    /// Silence everything (the global Stop key).
+
     StopAll,
 }
 
-/// One grabbable binding. Slots send `Play` bindings; the toolbar's Stop key
-/// sends a `StopAll` binding (no file needed, hence `path: None`).
 #[derive(Clone, Debug)]
 pub struct HotkeyBinding {
     pub id: SlotId,
@@ -70,8 +31,6 @@ pub struct HotkeyBinding {
 }
 
 impl HotkeyBinding {
-    /// A normal sound slot binding. `trim` mirrors the slot's trim bounds so
-    /// hotkey presses play the trimmed range too.
     pub fn play(id: SlotId, hotkey: Hotkey, path: PathBuf, trim: Option<TrimSpec>) -> Self {
         Self {
             id,
@@ -82,7 +41,6 @@ impl HotkeyBinding {
         }
     }
 
-    /// The global Stop key binding.
     pub fn stop(hotkey: Hotkey) -> Self {
         Self {
             id: STOP_ALL_ID,
@@ -94,7 +52,6 @@ impl HotkeyBinding {
     }
 }
 
-/// One press destination inside a shared OS grab.
 #[derive(Clone, Debug)]
 pub struct PressTarget {
     pub id: SlotId,
@@ -103,29 +60,20 @@ pub struct PressTarget {
     pub trim: Option<TrimSpec>,
 }
 
-/// UI → hotkey thread.
 #[derive(Debug)]
 pub enum HotkeyCommand {
-    /// Throw away all OS grabs and register exactly this set.
-    /// Full rebuilds (instead of diffs) keep the OS state trivially in sync —
-    /// with a handful of slots the cost is negligible.
     Rebuild(Vec<HotkeyBinding>),
 }
 
-/// Hotkey thread → UI (status only; presses bypass the UI entirely).
 #[derive(Debug)]
 pub enum HotkeyEvent {
-    /// The OS backend is up. Hotkeys now work while minimized.
     Ready,
-    /// No backend at all (e.g. Wayland dev box with no X11 grab available).
-    /// Mouse playback still works.
+
     Unavailable(String),
-    /// One binding could not be grabbed (held by another app, or rejected by
-    /// the OS). Everything else keeps working.
+
     KeyRejected { display: String, reason: String },
 }
 
-/// Spawn the hotkey thread. Presses are forwarded as `Play` on `audio_tx`.
 pub fn spawn_hotkey_thread(
     audio_tx: Sender<AudioCommand>,
 ) -> (Sender<HotkeyCommand>, Receiver<HotkeyEvent>) {
@@ -140,20 +88,6 @@ pub fn spawn_hotkey_thread(
     (cmd_tx, event_rx)
 }
 
-// --- egui labels → OS keys --------------------------------------------------
-
-/// Convert our stored binding to OS-grabbable hotkey(s).
-///
-/// Most labels map to exactly one [`Code`]. Labels for keys that exist twice
-/// on a full keyboard (top row *and* numpad) map to **both** twins, because
-/// `egui` reports them identically (its `Key::Num7` covers `Digit7` *and*
-/// `Numpad7`) while Windows delivers distinct virtual keys (`VK_7` vs
-/// `VK_NUMPAD7`). Grabbing only the top-row twin is the classic silent
-/// failure: the badge says "7", the user presses numpad 7, nothing fires.
-///
-/// `Err` is a plain-language reason for the user ("That key can't be grabbed
-/// …"), decided *without touching the OS* so the record flow can reject
-/// hopeless keys before they ever reach registration.
 pub fn to_global_hotkeys(binding: &Hotkey) -> Result<Vec<GlobalKey>, String> {
     let mut mods = Modifiers::empty();
     if binding.ctrl {
@@ -166,7 +100,6 @@ pub fn to_global_hotkeys(binding: &Hotkey) -> Result<Vec<GlobalKey>, String> {
         mods.insert(Modifiers::ALT);
     }
     if binding.mac_cmd {
-        // The Win key on Windows.
         mods.insert(Modifiers::SUPER);
     }
     let mods = if mods.is_empty() { None } else { Some(mods) };
@@ -175,7 +108,7 @@ pub fn to_global_hotkeys(binding: &Hotkey) -> Result<Vec<GlobalKey>, String> {
     if let Some(code) = code_for_label(&binding.key) {
         keys.push(GlobalKey::new(mods, code));
     }
-    // The numpad twin, if any (never a duplicate of the primary).
+
     if let Some(twin) = twin_code_for_label(&binding.key) {
         let twin_key = GlobalKey::new(mods, twin);
         if !keys.contains(&twin_key) {
@@ -190,8 +123,6 @@ pub fn to_global_hotkeys(binding: &Hotkey) -> Result<Vec<GlobalKey>, String> {
     }
 }
 
-/// The numpad twin of a doubly-existing key, if the label has one.
-/// "Plus" has *only* a twin (no top-row virtual key of its own).
 fn twin_code_for_label(label: &str) -> Option<Code> {
     if label.len() == 1 && label.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
         return format!("Numpad{label}").parse::<Code>().ok();
@@ -208,11 +139,7 @@ fn twin_code_for_label(label: &str) -> Option<Code> {
     }
 }
 
-/// Map an `egui::Key::name()` label to a physical [`Code`].
-/// `None` = not grabbable (shifted punctuation with no distinct physical key,
-/// or a bare modifier).
 fn code_for_label(label: &str) -> Option<Code> {
-    // Single characters: digits and A–Z live under different `Code` names.
     if label.len() == 1 {
         let ch = label.chars().next().expect("len checked");
         if ch.is_ascii_digit() {
@@ -233,10 +160,9 @@ fn code_for_label(label: &str) -> Option<Code> {
         "OpenBracket" => "BracketLeft",
         "CloseBracket" => "BracketRight",
         "Menu" => "ContextMenu",
-        // egui's label for the unshifted top-row `=`, which keyboard_types
-        // spells "Equal". Without this, pressing `=` was never grabbable.
+
         "Equals" => "Equal",
-        // Shifted punctuation / bare modifiers have no unambiguous grab.
+
         "Colon" | "Plus" | "Pipe" | "Questionmark" | "Exclamationmark" | "OpenCurlyBracket"
         | "CloseCurlyBracket" | "ShiftLeft" | "ShiftRight" | "ControlLeft" | "ControlRight"
         | "AltLeft" | "AltRight" | "SuperLeft" | "SuperRight" | "Unidentified" => return None,
@@ -268,8 +194,6 @@ fn unsuitable_key_reason(label: &str) -> String {
     }
 }
 
-// --- listener thread --------------------------------------------------------
-
 fn run_listener(
     cmd_rx: Receiver<HotkeyCommand>,
     event_tx: Sender<HotkeyEvent>,
@@ -282,7 +206,7 @@ fn run_listener(
             let _ = event_tx.send(HotkeyEvent::Unavailable(format!(
                 "System-wide hotkeys aren't available here ({err}). You can still click ▶ to play sounds."
             )));
-            // Stay alive and drain commands so the UI never blocks sending.
+
             while cmd_rx.recv().is_ok() {}
             return;
         }
@@ -291,15 +215,10 @@ fn run_listener(
     let _ = event_tx.send(HotkeyEvent::Ready);
     info!("Global hotkey backend ready.");
 
-    // Currently grabbed OS keys + which slots each id triggers. One OS grab
-    // may serve several targets (a leftover duplicate scheme plays together).
     let mut grabbed: Vec<GlobalKey> = Vec::new();
     let mut routing: HashMap<u32, Vec<PressTarget>> = HashMap::new();
 
     loop {
-        // Pump first so presses dispatch with no added latency; commands then
-        // get at most a PUMP_INTERVAL delay (20ms — imperceptible for
-        // (un)registration, which happens on human button clicks).
         pump_win32_messages();
 
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
@@ -328,17 +247,8 @@ fn run_listener(
     }
 }
 
-/// How long the listener waits for UI commands between Win32 message pumps
-/// (20ms — imperceptible for (un)registration, which happens on human button
-/// clicks; presses dispatch with zero added latency since the pump runs first).
-/// On Linux/macOS the same tick just rate-limits the poll loop; their backends
-/// push events from their own threads, no pump needed.
 const PUMP_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Run one non-blocking pass of the Win32 message loop.
-///
-/// See the module docs: without this, `RegisterHotKey` succeeds but presses
-/// sit in this thread's queue forever — silent dead hotkeys with no error.
 #[cfg(windows)]
 fn pump_win32_messages() {
     use windows_sys::Win32::Foundation::HWND;
@@ -347,9 +257,7 @@ fn pump_win32_messages() {
     };
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
-        // PM_REMOVE pulls each message off the queue; DispatchMessageW runs
-        // the crate's window proc, which forwards the press into the event
-        // channel drained above.
+
         while PeekMessageW(&mut msg, 0 as HWND, 0, 0, PM_REMOVE) != 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -360,7 +268,6 @@ fn pump_win32_messages() {
 #[cfg(not(windows))]
 fn pump_win32_messages() {}
 
-/// Replace every OS grab with exactly `bindings`.
 fn rebuild(
     manager: &GlobalHotKeyManager,
     event_tx: &Sender<HotkeyEvent>,
@@ -400,9 +307,6 @@ fn rebuild(
     info!("Hotkey rebuild complete: {} OS grabs.", grabbed.len());
 }
 
-/// Group bindings by identical OS hotkey so duplicates share one grab.
-/// Pure (no OS calls) so the grouping rules are unit-testable.
-/// Returns the groups plus `(display, reason)` pairs for unconvertible keys.
 type GroupedBindings = (HashMap<GlobalKey, Vec<PressTarget>>, Vec<(String, String)>);
 
 fn group_bindings(bindings: Vec<HotkeyBinding>) -> GroupedBindings {
@@ -411,8 +315,6 @@ fn group_bindings(bindings: Vec<HotkeyBinding>) -> GroupedBindings {
     for binding in bindings {
         match to_global_hotkeys(&binding.hotkey) {
             Ok(keys) => {
-                // One binding may own several grabs (numpad twins); every
-                // twin routes to the same targets.
                 for key in keys {
                     by_key.entry(key).or_default().push(PressTarget {
                         id: binding.id,
@@ -428,9 +330,6 @@ fn group_bindings(bindings: Vec<HotkeyBinding>) -> GroupedBindings {
     (by_key, rejected)
 }
 
-/// Forward one OS press to the audio engine: one command per mapped target
-/// (`Play` for sounds, `StopAll` for the Stop key).
-/// Returns how many commands were sent.
 fn dispatch_press(
     routing: &HashMap<u32, Vec<PressTarget>>,
     id: u32,
@@ -448,8 +347,7 @@ fn dispatch_press(
                     path: path.clone(),
                     trim: target.trim,
                 },
-                // Play without a file is a programming error upstream (the UI
-                // only sends playable slots); skip loudly instead of panicking.
+
                 None => {
                     warn!("Hotkey target {:?} has no file; skipping.", target.id);
                     continue;
@@ -464,7 +362,6 @@ fn dispatch_press(
     sent
 }
 
-/// Best-effort readable label for an OS key (used in conflict messages).
 fn key_to_display(key: &GlobalKey) -> String {
     let mut parts = Vec::new();
     if key.mods.contains(Modifiers::CONTROL) {
@@ -484,7 +381,6 @@ fn key_to_display(key: &GlobalKey) -> String {
 }
 
 fn code_label(code: &Code) -> &'static str {
-    // Short, familiar names for the keys people actually bind.
     match code {
         Code::Space => "Space",
         Code::ArrowDown => "Down",
@@ -495,7 +391,6 @@ fn code_label(code: &Code) -> &'static str {
     }
 }
 
-/// The canonical `Code` name (e.g. `KeyQ`, `Digit1`, `F6`).
 fn code_name(code: Code) -> &'static str {
     match code {
         Code::Backquote => "Backquote",
@@ -558,6 +453,67 @@ fn code_name(code: Code) -> &'static str {
         Code::AudioVolumeDown => "AudioVolumeDown",
         Code::AudioVolumeMute => "AudioVolumeMute",
         Code::AudioVolumeUp => "AudioVolumeUp",
+        Code::KeyA => "KeyA",
+        Code::KeyB => "KeyB",
+        Code::KeyC => "KeyC",
+        Code::KeyD => "KeyD",
+        Code::KeyE => "KeyE",
+        Code::KeyF => "KeyF",
+        Code::KeyG => "KeyG",
+        Code::KeyH => "KeyH",
+        Code::KeyI => "KeyI",
+        Code::KeyJ => "KeyJ",
+        Code::KeyK => "KeyK",
+        Code::KeyL => "KeyL",
+        Code::KeyM => "KeyM",
+        Code::KeyN => "KeyN",
+        Code::KeyO => "KeyO",
+        Code::KeyP => "KeyP",
+        Code::KeyQ => "KeyQ",
+        Code::KeyR => "KeyR",
+        Code::KeyS => "KeyS",
+        Code::KeyT => "KeyT",
+        Code::KeyU => "KeyU",
+        Code::KeyV => "KeyV",
+        Code::KeyW => "KeyW",
+        Code::KeyX => "KeyX",
+        Code::KeyY => "KeyY",
+        Code::KeyZ => "KeyZ",
+        Code::F1 => "F1",
+        Code::F2 => "F2",
+        Code::F3 => "F3",
+        Code::F4 => "F4",
+        Code::F5 => "F5",
+        Code::F6 => "F6",
+        Code::F7 => "F7",
+        Code::F8 => "F8",
+        Code::F9 => "F9",
+        Code::F10 => "F10",
+        Code::F11 => "F11",
+        Code::F12 => "F12",
+        Code::F13 => "F13",
+        Code::F14 => "F14",
+        Code::F15 => "F15",
+        Code::F16 => "F16",
+        Code::F17 => "F17",
+        Code::F18 => "F18",
+        Code::F19 => "F19",
+        Code::F20 => "F20",
+        Code::F21 => "F21",
+        Code::F22 => "F22",
+        Code::F23 => "F23",
+        Code::F24 => "F24",
+        Code::Numpad0 => "Numpad0",
+        Code::Numpad1 => "Numpad1",
+        Code::Numpad2 => "Numpad2",
+        Code::Numpad3 => "Numpad3",
+        Code::Numpad4 => "Numpad4",
+        Code::Numpad5 => "Numpad5",
+        Code::Numpad6 => "Numpad6",
+        Code::Numpad7 => "Numpad7",
+        Code::Numpad8 => "Numpad8",
+        Code::Numpad9 => "Numpad9",
+        Code::NumpadMultiply => "NumpadMultiply",
         _ => "key",
     }
 }
@@ -567,15 +523,16 @@ mod tests {
     use super::*;
     use crate::model::Hotkey;
 
-    /// Every egui key that should be grabbable must map to a physical code.
-    /// `egui::Key::ALL` is walked exhaustively so a future egui release adding
-    /// a key (or a label mismatch like `Equals`/`Equal`) fails here instead of
-    /// silently producing a hotkey that never fires.
+    #[test]
+    fn rejected_grab_names_the_actual_key() {
+        assert_eq!(code_label(&Code::KeyQ), "KeyQ");
+        assert_eq!(code_label(&Code::F6), "F6");
+        assert_eq!(code_label(&Code::Numpad7), "Numpad7");
+        assert_ne!(code_label(&Code::F6), "key");
+    }
+
     #[test]
     fn every_grabbable_egui_key_maps_to_a_code() {
-        // Labels that deliberately have no physical key to grab: shifted
-        // punctuation (which is a different physical key, not its own) and
-        // bare modifiers (grabbing one alone would swallow every chord).
         let refused: &[&str] = &[
             "Colon",
             "Plus",
@@ -593,7 +550,6 @@ mod tests {
             "SuperLeft",
             "SuperRight",
             "Unidentified",
-            // NumPad 5 with NumLock off: no distinct scancode of its own.
             "Clear",
         ];
 
@@ -602,15 +558,13 @@ mod tests {
             let mapped = code_for_label(label).is_some();
             let should_refuse = refused.contains(&label);
             assert_eq!(
-                mapped,
-                !should_refuse,
+                mapped, !should_refuse,
                 "egui key {label:?} mapping disagrees with the refused list \
                  (mapped={mapped}, expected refusal={should_refuse})",
             );
         }
     }
 
-    /// The regression reported from Windows: `=` must be grabbable.
     #[test]
     fn top_row_equals_grabs() {
         let binding = Hotkey::simple("Equals");
@@ -636,10 +590,7 @@ mod tests {
 
     #[test]
     fn letters_digits_and_space_map() {
-        assert_eq!(
-            to_global_hotkeys(&simple("K")).unwrap()[0].key,
-            Code::KeyK
-        );
+        assert_eq!(to_global_hotkeys(&simple("K")).unwrap()[0].key, Code::KeyK);
         assert_eq!(
             to_global_hotkeys(&simple("1")).unwrap()[0].key,
             Code::Digit1
@@ -695,7 +646,6 @@ mod tests {
 
     #[test]
     fn doublers_with_numpad_twins_are_accepted() {
-        // These shifted labels have real numpad twins, so they bind.
         for (label, twin) in [
             ("Plus", Code::NumpadAdd),
             ("Minus", Code::NumpadSubtract),
@@ -722,7 +672,6 @@ mod tests {
 
     #[test]
     fn digits_grab_both_top_row_and_numpad() {
-        // egui reports both physical keys as "7"; Windows needs both VKs.
         let keys = to_global_hotkeys(&simple("7")).unwrap();
         assert_eq!(keys.len(), 2);
         let codes: Vec<Code> = keys.iter().map(|k| k.key).collect();
@@ -732,8 +681,6 @@ mod tests {
 
     #[test]
     fn plus_grabs_numpad_add_only() {
-        // No top-row virtual key exists for Plus — the numpad twin is the
-        // whole binding.
         let keys = to_global_hotkeys(&simple("Plus")).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key, Code::NumpadAdd);
@@ -753,8 +700,6 @@ mod tests {
 
     #[test]
     fn identical_bindings_share_one_os_key() {
-        // Same inputs must produce equal `HotKey`s (same id) so the rebuild
-        // grouping shares a single OS registration for duplicates.
         let a = to_global_hotkeys(&simple("F6")).unwrap()[0];
         let b = to_global_hotkeys(&simple("F6")).unwrap()[0];
         assert_eq!(a, b);
@@ -774,7 +719,7 @@ mod tests {
         ];
         let (groups, rejected) = group_bindings(bindings);
         assert!(rejected.is_empty());
-        // Two distinct OS keys for three slots.
+
         assert_eq!(groups.len(), 2);
         let shared = to_global_hotkeys(&simple("F6")).unwrap()[0];
         let targets = &groups[&shared];
@@ -819,16 +764,18 @@ mod tests {
         assert_eq!(sent, 2);
 
         let mut got = Vec::new();
-        while let Ok(AudioCommand::Play { id, path, trim: None }) = audio_rx.try_recv() {
+        while let Ok(AudioCommand::Play {
+            id,
+            path,
+            trim: None,
+        }) = audio_rx.try_recv()
+        {
             got.push((id, path));
         }
         got.sort_by_key(|(id, _)| *id);
         assert_eq!(
             got,
-            vec![
-                (1, PathBuf::from("/a.mp3")),
-                (2, PathBuf::from("/b.mp3"))
-            ]
+            vec![(1, PathBuf::from("/a.mp3")), (2, PathBuf::from("/b.mp3"))]
         );
     }
 
@@ -848,10 +795,7 @@ mod tests {
 
         let (audio_tx, audio_rx) = crossbeam_channel::unbounded();
         assert_eq!(dispatch_press(&routing, key.id(), &audio_tx), 1);
-        assert!(matches!(
-            audio_rx.try_recv(),
-            Ok(AudioCommand::StopAll)
-        ));
+        assert!(matches!(audio_rx.try_recv(), Ok(AudioCommand::StopAll)));
     }
 
     #[test]

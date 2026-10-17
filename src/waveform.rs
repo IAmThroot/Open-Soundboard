@@ -1,48 +1,28 @@
-//! Waveform preview data for the trim editor.
-//!
-//! A sound file is decoded once into mono `f32` samples, then reduced to a
-//! fixed number of (min, max) peak pairs — one pair per horizontal pixel
-//! column of the editor canvas. Only the peaks are kept: a 3-minute song
-//! becomes 200 pairs, not 16 million samples.
-//!
-//! The same decode pass measures the **exact** duration (sample count ÷ rate).
-//! That number — not file metadata, which lies for MP3s — is what trim
-//! fractions are resolved against, both in the editor and at playback.
-
 use std::path::Path;
 use std::time::Duration;
 
 use rodio::{Decoder, Source};
 
-/// Peaks per editor canvas. 200 columns is plenty at tile-editor sizes.
 pub const WAVE_BUCKETS: usize = 200;
 
-/// Refuse to decode absurdly long files for preview (10 minutes of stereo
-/// 48kHz ≈ 57M samples). Trim editing is for clips, not podcasts; playback of
-/// long files is unaffected (it streams).
 const MAX_SAMPLES: usize = 60_000_000;
 
-/// Everything the editor needs, computed once per file.
 #[derive(Clone, Debug)]
 pub struct Waveform {
-    /// One (min, max) peak per bucket, amplitudes normalized to -1.0..1.0.
     pub peaks: Vec<(f32, f32)>,
-    /// Exact duration in seconds, from the decoded sample count.
+
     pub duration_secs: f32,
 }
 
-/// Decode `path` and reduce it to peaks + duration. `Err` is plain language
-/// for the editor ("That file could not be read…").
 pub fn build_waveform(path: &Path) -> Result<Waveform, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|err| format!("That file could not be read: {err}"))?;
+    let file =
+        std::fs::File::open(path).map_err(|err| format!("That file could not be read: {err}"))?;
     let decoder =
         Decoder::new(file).map_err(|err| format!("That file could not be decoded: {err}"))?;
 
     let channels = decoder.channels().get() as usize;
     let sample_rate = decoder.sample_rate().get();
 
-    // Mix down to mono frames while streaming: average each channel group.
     let mut mono: Vec<f32> = Vec::new();
     let mut frame = vec![0.0f32; channels];
     let mut filled = 0;
@@ -70,8 +50,6 @@ pub fn build_waveform(path: &Path) -> Result<Waveform, String> {
     })
 }
 
-/// Reduce samples to exactly `buckets` (min, max) pairs. Short inputs repeat
-/// their last peak so the canvas never divides by zero.
 fn reduce_peaks(mono: &[f32], buckets: usize) -> Vec<(f32, f32)> {
     assert!(buckets > 0);
     if mono.is_empty() {
@@ -81,7 +59,9 @@ fn reduce_peaks(mono: &[f32], buckets: usize) -> Vec<(f32, f32)> {
     (0..buckets)
         .map(|b| {
             let start = (b as f32 * per_bucket) as usize;
-            let end = (((b + 1) as f32 * per_bucket) as usize).max(start + 1).min(mono.len());
+            let end = (((b + 1) as f32 * per_bucket) as usize)
+                .max(start + 1)
+                .min(mono.len());
             let slice = &mono[start.min(mono.len() - 1)..end];
             let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
             for &s in slice {
@@ -93,9 +73,11 @@ fn reduce_peaks(mono: &[f32], buckets: usize) -> Vec<(f32, f32)> {
         .collect()
 }
 
-/// Resolve trim fractions to concrete skip/take durations. Returns `None`
-/// when the trim is the full sound (caller plays normally).
-pub fn trim_durations(start_frac: f32, end_frac: f32, duration_secs: f32) -> Option<(Duration, Duration)> {
+pub fn trim_durations(
+    start_frac: f32,
+    end_frac: f32,
+    duration_secs: f32,
+) -> Option<(Duration, Duration)> {
     let start = start_frac.clamp(0.0, 1.0);
     let end = end_frac.clamp(start, 1.0);
     if start <= 0.0 && end >= 1.0 {
@@ -121,7 +103,7 @@ mod tests {
         let samples = sine_mono(48_000, 440.0, 48_000.0);
         let peaks = reduce_peaks(&samples, 200);
         assert_eq!(peaks.len(), 200);
-        // A full sine must hit near ±1 somewhere.
+
         let hi = peaks.iter().map(|(_, max)| *max).fold(0.0f32, f32::max);
         let lo = peaks.iter().map(|(min, _)| *min).fold(0.0f32, f32::min);
         assert!(hi > 0.99, "max peak {hi}");
@@ -166,7 +148,6 @@ mod tests {
         assert!((skip.as_secs_f32() - 8.0).abs() < 0.001);
     }
 
-    /// Write a minimal mono 16-bit WAV for decode tests.
     fn write_wav(path: &std::path::Path, millis: u32) {
         let rate = 44_100u32;
         let samples = rate * millis / 1000;
@@ -200,14 +181,23 @@ mod tests {
 
         let wave = build_waveform(&path).expect("test wav must decode");
         assert_eq!(wave.peaks.len(), WAVE_BUCKETS);
-        assert!((wave.duration_secs - 1.0).abs() < 0.01, "got {}", wave.duration_secs);
-        let hi = wave.peaks.iter().map(|(_, max)| *max).fold(0.0f32, f32::max);
+        assert!(
+            (wave.duration_secs - 1.0).abs() < 0.01,
+            "got {}",
+            wave.duration_secs
+        );
+        let hi = wave
+            .peaks
+            .iter()
+            .map(|(_, max)| *max)
+            .fold(0.0f32, f32::max);
         assert!(hi > 0.2, "peaks should show the tone, got {hi}");
     }
 
     #[test]
     fn missing_file_is_a_plain_language_error() {
-        let err = build_waveform(std::path::Path::new("/nope/not-here.wav")).expect_err("must fail");
+        let err =
+            build_waveform(std::path::Path::new("/nope/not-here.wav")).expect_err("must fail");
         assert!(err.contains("could not be read"), "got: {err}");
     }
 

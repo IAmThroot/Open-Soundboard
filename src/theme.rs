@@ -1,21 +1,13 @@
-//! Visual design tokens and global style setup.
-//!
-//! Keeping every colour and spacing value in one place makes the "friendly,
-//! non-technical" look easy to tune without hunting through layout code.
-
 use egui::{Color32, CornerRadius, Stroke, Vec2};
 
-// --- Surfaces -------------------------------------------------------------
 pub const BG: Color32 = Color32::from_rgb(0x15, 0x17, 0x1c);
 pub const PANEL: Color32 = Color32::from_rgb(0x1c, 0x1f, 0x26);
 pub const BG_SOFT: Color32 = Color32::from_rgb(0x24, 0x28, 0x31);
 pub const BORDER: Color32 = Color32::from_rgb(0x32, 0x37, 0x42);
 
-// --- Text -----------------------------------------------------------------
 pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe9, 0xef);
 pub const MUTED: Color32 = Color32::from_rgb(0x96, 0x9e, 0xb0);
 
-// --- Accents --------------------------------------------------------------
 pub const ACCENT: Color32 = Color32::from_rgb(0x3b, 0x82, 0xf6);
 pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0x1e, 0x2c, 0x46);
 pub const GOOD: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
@@ -24,8 +16,6 @@ pub const GOOD_TINT: Color32 = Color32::from_rgb(0x1a, 0x2a, 0x22);
 pub const DANGER: Color32 = Color32::from_rgb(0xef, 0x44, 0x44);
 pub const WARN: Color32 = Color32::from_rgb(0xf5, 0x9e, 0x0b);
 
-/// Install the app-wide look: dark surfaces, soft rounded widgets, roomy
-/// spacing. Called once when the app starts.
 pub fn apply(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
 
@@ -35,7 +25,6 @@ pub fn apply(ctx: &egui::Context) {
     visuals.faint_bg_color = BG_SOFT;
     visuals.extreme_bg_color = Color32::from_rgb(0x0f, 0x11, 0x15);
 
-    // Interactive widgets (buttons, dropdowns, sliders).
     for widget in [
         &mut visuals.widgets.inactive,
         &mut visuals.widgets.hovered,

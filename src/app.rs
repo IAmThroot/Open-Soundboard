@@ -1,14 +1,3 @@
-//! Phase 2: real local playback + native file picking.
-//!
-//! The UI owns no audio state itself. It sends [`AudioCommand`]s to the
-//! background engine thread (`src/audio.rs`) and reflects the [`AudioEvent`]s
-//! that come back (tile highlights, missing-file flags, error toasts).
-//!
-//! UI construction is split into free functions that *return* the action the
-//! user intended (`SlotAction`) rather than mutating app state directly. The
-//! app applies those actions after the frame is drawn. This keeps borrows
-//! simple and makes the data flow easy to follow.
-
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -23,38 +12,33 @@ use log::debug;
 use crate::audio::{spawn_audio_engine, AudioCommand, AudioEvent, TrimSpec, TEST_SOUND_ID};
 use crate::config::{self, AppState, STATE_VERSION};
 use crate::devices::{list_output_devices, SYSTEM_DEFAULT_LABEL};
-use crate::waveform::{build_waveform, Waveform};
 use crate::hotkey::{
     spawn_hotkey_thread, to_global_hotkeys, HotkeyBinding, HotkeyCommand, HotkeyEvent, STOP_ALL_ID,
 };
-use crate::record::{spawn_recorder, RecordCommand, RecordEvent};
-use crate::tray::{Tray, TrayAction};
 use crate::model::{Board, BoardId, Hotkey, SlotId, SoundSlot};
+use crate::record::{spawn_recorder, RecordCommand, RecordEvent};
 use crate::theme;
+use crate::tray::{Tray, TrayAction};
+use crate::waveform::{build_waveform, Waveform};
 
-/// Fixed tile geometry (in points). Tiles are large on purpose: easy targets.
 const SLOT_W: f32 = 200.0;
 const SLOT_H: f32 = 156.0;
 const SLOT_PAD: f32 = 12.0;
 const SLOT_GAP: f32 = 12.0;
 
-/// Everything the user can ask a tile to do. Collected during drawing and
-/// applied afterwards.
 enum SlotAction {
-    /// Open the native picker; if a file is chosen, append a filled slot.
     AddViaPicker,
     Play(SlotId),
     Stop(SlotId),
     StartRecording(SlotId),
     ClearHotkey(SlotId),
     Remove(SlotId),
-    /// Open the trim editor for this slot.
+
     Edit(SlotId),
-    /// Re-link a missing file through the native picker.
+
     FindAgain(SlotId),
 }
 
-/// A pending yes/no question shown as a modal (e.g. duplicate hotkey).
 #[derive(Clone)]
 struct Confirm {
     message: String,
@@ -87,7 +71,6 @@ struct Toast {
 }
 
 pub struct SoundboardApp {
-    /// Every board; exactly one is active (visible, grabbed) at a time.
     boards: Vec<Board>,
     active_board: BoardId,
 
@@ -95,78 +78,64 @@ pub struct SoundboardApp {
     output_device: String,
     volume: f32,
 
-    /// Channels to the background audio engine (see `src/audio.rs`).
     audio_tx: Sender<AudioCommand>,
     audio_rx: Receiver<AudioEvent>,
 
-    /// Channels to the global-hotkey thread (see `src/hotkey.rs`).
     hotkey_tx: Sender<HotkeyCommand>,
     hotkey_rx: Receiver<HotkeyEvent>,
     hotkey_state: HotkeyBackendState,
-    /// Channels to the mic recorder thread (see `src/record.rs`).
+
     record_tx: Sender<RecordCommand>,
     record_rx: Receiver<RecordEvent>,
-    /// An in-progress microphone take (started when the red button was hit).
+
     mic: Option<MicTake>,
-    /// `Start` sent, waiting for the recorder to confirm. Drives the
-    /// "Starting…" button state and the watchdog that restarts the recorder
-    /// thread if a device open wedges inside cpal.
+
     mic_starting: Option<Instant>,
-    /// Microphone picker: discovered input devices + the current choice.
-    /// The OS default is frequently a silent virtual endpoint (VB-Cable's
-    /// `CABLE Output`), so the user must be able to pick explicitly.
+
     mic_devices: Vec<String>,
     mic_device: String,
-    /// The global Stop key: silences everything, even while minimized.
-    /// `None` = not bound yet (toolbar badge invites setting it).
+
     stop_hotkey: Option<Hotkey>,
-    /// Set by every mutation; flushed to disk debounced (see `maybe_autosave`).
+
     config_dirty: bool,
     last_save: Instant,
-    /// Slots whose files decode-failed: excluded from OS grabs until re-linked.
-    /// (Missing files are already excluded via `slot.missing`.)
+
     broken: HashSet<SlotId>,
 
-    /// Which tile is currently waiting for the user to press keys.
+    next_slot_id: SlotId,
+
     recording: Option<SlotId>,
-    /// Tiles with sound currently coming out of the speakers.
-    /// Driven by `Started` / `Finished` engine events, not timers.
+
     playing: HashSet<SlotId>,
-    /// The Test Sound beep is playing (it has no tile to highlight).
+
     testing: bool,
 
     confirm: Option<Confirm>,
     toast: Option<Toast>,
-    /// Rename / delete-board modal. Only one modal shows at a time (hotkey
-    /// confirms and board dialogs never overlap: recording must finish first).
+
     board_dialog: Option<BoardDialog>,
-    /// Trim editor state (modal). Only one editor at a time.
+
     editor: Option<EditorState>,
-    /// Decoded waveforms, built off-thread on demand.
+
     waves: WaveCache,
-    /// System-tray icon, `None` if Windows refused it (or non-Windows).
+
     tray: Option<Tray>,
-    /// User preference: closing the window hides to the tray instead of
-    /// quitting (see the Settings dialog).
+
     close_to_tray: bool,
-    /// Settings dialog visibility.
+
     settings_open: bool,
-    /// Set when the user asked to quit from the tray, so the close handler
-    /// lets the close through instead of hiding to the tray again.
+
     quit_requested: bool,
-    /// Whether the main window is currently shown. Input events are only
-    /// meaningful while it is (a hidden viewport gets no fresh events), which
-    /// gates hotkey recording.
+
     window_visible: bool,
 }
 
-/// What the trim editor is changing. Bounds are a working copy until Save.
 #[derive(Clone)]
 struct EditorState {
     slot: SlotId,
     start_frac: f32,
     end_frac: f32,
-    /// Which handle the current drag is moving (chosen on drag start).
+
     drag: Option<EditorHandle>,
 }
 
@@ -176,14 +145,14 @@ enum EditorHandle {
     End,
 }
 
-/// Async waveform store: at most one decode per slot in flight; late
-/// responses for re-linked files are dropped by path check.
 struct WaveCache {
     ready: HashMap<SlotId, Result<Waveform, String>>,
     pending: HashSet<SlotId>,
     tx: crossbeam_channel::Sender<(SlotId, PathBuf, Result<Waveform, String>)>,
     rx: crossbeam_channel::Receiver<(SlotId, PathBuf, Result<Waveform, String>)>,
 }
+
+const MAX_CACHED_WAVEFORMS: usize = 16;
 
 impl WaveCache {
     fn new() -> Self {
@@ -196,10 +165,15 @@ impl WaveCache {
         }
     }
 
-    /// Start a background decode unless cached or already running.
     fn request(&mut self, id: SlotId, path: PathBuf) {
         if self.ready.contains_key(&id) || !self.pending.insert(id) {
             return;
+        }
+
+        if self.ready.len() >= MAX_CACHED_WAVEFORMS {
+            if let Some(&evict) = self.ready.keys().next() {
+                self.ready.remove(&evict);
+            }
         }
         let tx = self.tx.clone();
         std::thread::Builder::new()
@@ -217,37 +191,37 @@ impl WaveCache {
     }
 }
 
-/// A board management modal.
 enum BoardDialog {
-    Rename { id: BoardId, name: String },
-    Delete { id: BoardId, name: String, sounds: usize },
+    Rename {
+        id: BoardId,
+        name: String,
+    },
+    Delete {
+        id: BoardId,
+        name: String,
+        sounds: usize,
+    },
 }
 
-/// Attribution shown next to the version badge in the title bar. Clicking it
-/// opens the author's GitHub profile in the default browser.
 const AUTHOR_URL: &str = "https://github.com/IAmThroot";
 const AUTHOR_CREDIT: &str = "Built by IAmThroot";
 
-/// Frame budget for the tile glow animation (~30 FPS: smooth, cheap).
 const TILE_ANIMATION_FRAME: Duration = Duration::from_millis(33);
-/// Frame budget for the recording timer (10 FPS shows tenths cleanly).
+
 const TIMER_FRAME: Duration = Duration::from_millis(100);
-/// Deadline for a microphone start before the watchdog fires.
+
 const MIC_START_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// A microphone take in progress.
 struct MicTake {
     started: Instant,
 }
 
-/// What the status bar truthfully reports about system-wide hotkeys.
 #[derive(Clone)]
 enum HotkeyBackendState {
-    /// Thread starting, no word from the OS yet.
     Starting,
-    /// Grabs are live — minimizing is safe.
+
     Active,
-    /// No backend (Wayland dev box) or all grabs refused. Mouse still works.
+
     Unavailable(String),
 }
 
@@ -263,15 +237,11 @@ impl SoundboardApp {
         let mut output_device = SYSTEM_DEFAULT_LABEL.to_owned();
         let mut volume = 0.7;
         let mut stop_hotkey: Option<Hotkey> = None;
-        // Microphone picker: enumerate inputs up front; the saved choice may
-        // be a device that is currently unplugged (kept in the list so it
-        // reappears when replugged, mirroring the output picker's behavior).
+
         let mut mic_devices = crate::devices::list_input_devices();
         let mut mic_device = SYSTEM_DEFAULT_LABEL.to_owned();
         let mut close_to_tray = false;
 
-        // Restore the saved state when there is one; otherwise start with one
-        // empty board — the grid's "No sounds yet" state points at ➕ Add Sound.
         let mut boards: Vec<Board> = vec![Board::empty(1, "My Sounds")];
         let mut active_board: BoardId = 1;
         if let Some(saved) = config::load() {
@@ -280,9 +250,6 @@ impl SoundboardApp {
             boards = saved.boards;
             active_board = saved.active_board;
             if let Some(saved_device) = saved.output_device_name {
-                // The saved device may be gone (unplugged cable). Keep the
-                // name selected anyway: the engine falls back with a warning,
-                // and reappears in the list via Refresh when replugged.
                 if !output_devices.contains(&saved_device) {
                     output_devices.insert(1, saved_device.clone());
                 }
@@ -295,23 +262,16 @@ impl SoundboardApp {
                 }
                 mic_device = saved_mic;
             }
-            log::info!(
-                "Restored {} boards from config.",
-                boards.len()
-            );
+            log::info!("Restored {} boards from config.", boards.len());
         }
 
-        // The engine opens the device on its own thread; the UI stays fluid.
-        // `DeviceReady` / fallback notes arrive as events on the next frames.
-        let (audio_tx, audio_rx) =
-            spawn_audio_engine(output_device.clone(), volume);
+        let (audio_tx, audio_rx) = spawn_audio_engine(output_device.clone(), volume);
 
-        // The hotkey thread forwards presses straight to `audio_tx`, so it
-        // needs its own clone — presses bypass the UI entirely.
         let (hotkey_tx, hotkey_rx) = spawn_hotkey_thread(audio_tx.clone());
 
-        // The recorder lives on its own thread too; takes arrive as events.
         let (record_tx, record_rx) = spawn_recorder();
+
+        let next_slot_id = config::next_slot_id(&boards);
 
         let app = Self {
             boards,
@@ -334,6 +294,7 @@ impl SoundboardApp {
             config_dirty: false,
             last_save: Instant::now(),
             broken: HashSet::new(),
+            next_slot_id,
             recording: None,
             playing: HashSet::new(),
             testing: false,
@@ -348,29 +309,23 @@ impl SoundboardApp {
             quit_requested: false,
             window_visible: true,
         };
-        // Grab restored bindings, if any (a fresh board has none).
+
         app.push_hotkey_rebuild();
-        // Window icon (title bar / Alt-Tab / taskbar), drawn from the same art
-        // as the .exe icon so they can never drift.
+
         {
             const SIZE: u32 = 64;
-            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(
-                std::sync::Arc::new(egui::IconData {
-                    rgba: crate::icon_art::draw(SIZE),
-                    width: SIZE,
-                    height: SIZE,
-                }),
-            )));
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
+                    egui::IconData {
+                        rgba: crate::icon_art::draw(SIZE),
+                        width: SIZE,
+                        height: SIZE,
+                    },
+                ))));
         }
         app
     }
 
-    /// Tray interaction and the close-to-tray interception. Every frame.
-    ///
-    /// Close semantics with the option on: the window button hides the app
-    /// (it disappears from the taskbar, the tray icon stays, hotkeys keep
-    /// working) and quitting happens from the tray menu. With the option
-    /// off, close quits — the app's original behavior.
     fn handle_tray(&mut self, ctx: &egui::Context) {
         if let Some(tray) = &self.tray {
             for action in tray.poll() {
@@ -382,7 +337,6 @@ impl SoundboardApp {
                         ctx.request_repaint();
                     }
                     TrayAction::Quit => {
-                        // Let the close through instead of hiding to the tray.
                         self.quit_requested = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -391,15 +345,21 @@ impl SoundboardApp {
         }
 
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        // `tray.is_some()` is essential: if the icon failed to create (or the
-        // build has no tray), hiding the window would leave no way to bring
-        // it back — closing must keep quitting in that case.
+
         if close_requested && !self.quit_requested && self.close_to_tray && self.tray.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.window_visible = false;
-            // Flush pending changes now: no window means no chance to explain
-            // a save failure later.
+
+            if self.recording.is_some() {
+                self.recording = None;
+                self.push_hotkey_rebuild();
+                self.toast(
+                    ToastKind::Info,
+                    "Hotkey recording cancelled — window hidden to tray.",
+                );
+            }
+
             if self.config_dirty {
                 self.save_now();
             }
@@ -407,7 +367,6 @@ impl SoundboardApp {
         }
     }
 
-    /// Settings dialog (⚙ in the toolbar): currently just the tray toggle.
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -419,8 +378,8 @@ impl SoundboardApp {
             .resizable(false)
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
             .show(ctx, |ui| {
-                // Enabled only when a tray icon actually exists (Windows);
-                // the stub platform reports `None`.
+
+
                 ui.add_enabled_ui(self.tray.is_some(), |ui| {
                     ui.checkbox(
                         &mut self.close_to_tray,
@@ -463,14 +422,15 @@ impl SoundboardApp {
     }
 
     fn alloc_id(&mut self) -> SlotId {
-        config::next_slot_id(&self.boards)
+        let id = self.next_slot_id;
+        self.next_slot_id = id.saturating_add(1);
+        id
     }
 
     fn alloc_board_id(&self) -> BoardId {
         config::next_board_id(&self.boards)
     }
 
-    /// The visible board.
     fn active(&self) -> &Board {
         self.boards
             .iter()
@@ -486,16 +446,12 @@ impl SoundboardApp {
             .expect("active board always exists")
     }
 
-    /// Find a slot on any board (presses only ever address the active one,
-    /// but engine events are resolved defensively across all boards).
     fn find_slot_mut(&mut self, id: SlotId) -> Option<&mut SoundSlot> {
         self.boards
             .iter_mut()
             .flat_map(|b| b.slots.iter_mut())
             .find(|s| s.id == id)
     }
-
-    // --- feedback ---------------------------------------------------------
 
     fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
         self.toast = Some(Toast {
@@ -524,13 +480,7 @@ impl SoundboardApp {
         }
     }
 
-    /// Send the current grabbable bindings to the hotkey thread.
-    /// Slots count when they have a hotkey, point at a file, and are neither
-    /// missing nor decode-broken. The Stop key is included when bound.
-    /// Each key is owned by at most one target (see `guard_hotkey`).
     fn push_hotkey_rebuild(&self) {
-        // Only the ACTIVE board is ever grabbed — other boards' identical keys
-        // stay dormant until switched to.
         let mut bindings: Vec<HotkeyBinding> = self
             .active()
             .slots
@@ -551,7 +501,6 @@ impl SoundboardApp {
         let _ = self.hotkey_tx.send(HotkeyCommand::Rebuild(bindings));
     }
 
-    /// Switch to another board: silence the old one, grab the new one's keys.
     fn switch_board(&mut self, id: BoardId) {
         if id == self.active_board {
             return;
@@ -567,7 +516,6 @@ impl SoundboardApp {
         self.mark_dirty();
     }
 
-    /// Create a board with a unique default name and switch to it.
     fn add_board(&mut self) {
         let mut n = self.boards.len() + 1;
         loop {
@@ -593,9 +541,10 @@ impl SoundboardApp {
         let removed: Board = self.boards.remove(pos);
         for slot in &removed.slots {
             self.broken.remove(&slot.id);
+            self.waves.invalidate(slot.id);
         }
         self.board_dialog = None;
-        // Landing board: neighbour if there is one, else the first.
+
         let landing = self
             .boards
             .get(pos.min(self.boards.len().saturating_sub(1)))
@@ -603,32 +552,29 @@ impl SoundboardApp {
             .expect("at least one board remains");
         self.switch_board(landing);
         self.mark_dirty();
-        self.toast(
-            ToastKind::Info,
-            format!("Deleted “{}”.", removed.name),
-        );
+        self.toast(ToastKind::Info, format!("Deleted “{}”.", removed.name));
     }
 
-    /// Drop every OS grab (used while recording a key — see `handle_recording`).
     fn suspend_hotkey_grabs(&self) {
         debug!("Suspending all OS grabs while recording.");
         let _ = self.hotkey_tx.send(HotkeyCommand::Rebuild(Vec::new()));
     }
 
-    /// Assign a freshly recorded hotkey. One key = one owner: if the key is
-    /// taken, the user is offered a *move* (unbind there, bind here), never a
-    /// silent share.
     fn guard_hotkey(&mut self, id: SlotId, hotkey: Hotkey) {
-        // Reject keys the OS could never grab before any duplicate chat.
         if let Err(reason) = to_global_hotkeys(&hotkey) {
-            debug!("Bind rejected (ungrabbable): slot={id} key={}", hotkey.display());
+            debug!(
+                "Bind rejected (ungrabbable): slot={id} key={}",
+                hotkey.display()
+            );
             self.toast(ToastKind::Warn, reason);
             return;
         }
 
-        // The Stop key is special: it must be freed there first.
         if self.stop_hotkey.as_ref() == Some(&hotkey) {
-            debug!("Bind refused (stop key): slot={id} key={}", hotkey.display());
+            debug!(
+                "Bind refused (stop key): slot={id} key={}",
+                hotkey.display()
+            );
             self.toast(
                 ToastKind::Warn,
                 format!(
@@ -640,8 +586,6 @@ impl SoundboardApp {
             return;
         }
 
-        // Clash scope is the ACTIVE board only: the same key may live on other
-        // boards (their grabs are never live at the same time).
         let clash = self
             .active()
             .slots
@@ -655,9 +599,6 @@ impl SoundboardApp {
             return;
         }
 
-        // A taken key always offers the move; a merely risky key offers
-        // "use anyway". When both apply, the move dialog wins and the risk is
-        // still surfaced by the warning toast after moving.
         if let Some((other_id, other)) = clash {
             debug!(
                 "Bind clash: key={} already on slot={other_id}; showing move dialog for slot={id}.",
@@ -685,19 +626,12 @@ impl SoundboardApp {
         });
     }
 
-    /// Validate and store a freshly recorded Stop key. The user may pick any
-    /// physically grabbable key — including bare letters, with a heads-up that
-    /// they fire while typing. Only two things stay impossible: keys the OS
-    /// cannot grab at all (rejected with the technical reason), and keys that
-    /// already play a sound (that press would play *and* stop at once).
     fn guard_stop_hotkey(&mut self, hotkey: Hotkey) {
         if let Err(reason) = to_global_hotkeys(&hotkey) {
             self.toast(ToastKind::Warn, reason);
             return;
         }
-        // The Stop key is global, so it must not collide on ANY board: a slot
-        // holding the same key on an inactive board today becomes a Play+Stop
-        // double-trigger the moment that board is switched to.
+
         if let Some(owner) = self
             .boards
             .iter()
@@ -736,8 +670,6 @@ impl SoundboardApp {
         }
     }
 
-    // --- panels -----------------------------------------------------------
-
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let frame = Frame::NONE
             .fill(theme::PANEL)
@@ -750,16 +682,13 @@ impl SoundboardApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("🔊  Open Soundboard").size(18.0).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // From Cargo.toml, so bumping the version there is
-                        // enough — the badge can never drift.
                         ui.label(
                             RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                                 .size(11.5)
                                 .color(theme::MUTED),
                         );
                         ui.label(RichText::new("·").size(11.5).color(theme::MUTED));
-                        // Attribution link: egui opens the URL in the
-                        // default browser on click.
+
                         ui.hyperlink_to(
                             RichText::new(AUTHOR_CREDIT).size(11.5).color(theme::MUTED),
                             AUTHOR_URL,
@@ -785,9 +714,7 @@ impl SoundboardApp {
                                 );
                             }
                         });
-                    // Switching devices drops whatever is playing (the old
-                    // OS stream is closed), so clear the highlights now; the
-                    // engine confirms with a `DeviceReady` event.
+
                     if self.output_device != before {
                         self.playing.clear();
                         self.testing = false;
@@ -799,25 +726,19 @@ impl SoundboardApp {
                         );
                     }
 
-                    // New hardware (e.g. freshly installed VB-Cable) appears
-                    // without restarting the app.
                     if ui
                         .small_button("↻")
                         .on_hover_text("Look for newly plugged in devices")
                         .clicked()
                     {
                         self.output_devices = list_output_devices();
-                        // The saved selection may have vanished; keep it if it
-                        // is still there, otherwise fall back to System Default.
+
                         if !self.output_devices.contains(&self.output_device) {
                             self.output_device = SYSTEM_DEFAULT_LABEL.to_owned();
                             self.send(AudioCommand::SetDevice(self.output_device.clone()));
                             self.mark_dirty();
                         }
-                        self.toast(
-                            ToastKind::Info,
-                            "Device list refreshed.",
-                        );
+                        self.toast(ToastKind::Info, "Device list refreshed.");
                     }
 
                     let test_label = if self.testing {
@@ -888,10 +809,7 @@ impl SoundboardApp {
 
                     let any_playing = !self.playing.is_empty() || self.testing;
                     if ui
-                        .add_enabled(
-                            any_playing,
-                            Button::new(RichText::new("⏹  Stop All")),
-                        )
+                        .add_enabled(any_playing, Button::new(RichText::new("⏹  Stop All")))
                         .on_hover_text("Stop every sound right now")
                         .clicked()
                     {
@@ -900,14 +818,9 @@ impl SoundboardApp {
                         self.send(AudioCommand::StopAll);
                     }
 
-                    // The global Stop key: same action, triggerable from any
-                    // app while minimized. Click to bind, right-click to clear.
                     let recording_stop = self.recording == Some(STOP_ALL_ID);
                     let (stop_text, stop_colour) = if recording_stop {
-                        (
-                            "Press keys…  (Esc to cancel)".to_owned(),
-                            theme::TEXT,
-                        )
+                        ("Press keys…  (Esc to cancel)".to_owned(), theme::TEXT)
                     } else {
                         match &self.stop_hotkey {
                             Some(hotkey) => (hotkey.display(), theme::TEXT),
@@ -922,7 +835,6 @@ impl SoundboardApp {
                             .corner_radius(CornerRadius::same(8)),
                     );
                     if recording_stop {
-                        // Swallow clicks until a key (or Esc) lands.
                     } else if stop_badge.clicked() {
                         debug!("Arming hotkey record for the Stop key.");
                         self.recording = Some(STOP_ALL_ID);
@@ -942,8 +854,6 @@ impl SoundboardApp {
                         );
                     }
 
-                    // Microphone recording: red button toggles a take. Takes
-                    // land on this board automatically when stopped.
                     if let Some(take) = &self.mic {
                         let elapsed = fmt_time(take.started.elapsed().as_secs_f32());
                         if ui
@@ -957,53 +867,50 @@ impl SoundboardApp {
                                 .fill(theme::DANGER)
                                 .corner_radius(CornerRadius::same(8)),
                             )
-                            .on_hover_text("Stop recording and keep the take (quitting discards it)")
+                            .on_hover_text(
+                                "Stop recording and keep the take (quitting discards it)",
+                            )
                             .clicked()
                         {
                             let _ = self.record_tx.send(RecordCommand::Stop);
                             self.toast(ToastKind::Info, "Finishing the take…");
                         }
                     } else {
-                        // Mic picker (small: the toolbar is shared with the
-                        // output picker, so keep it compact). Frozen while a
-                        // start is in flight so the choice matches the take.
                         let starting = self.mic_starting.is_some();
-                        let mut chosen = self.mic_device.clone();
-                        egui::ComboBox::from_id_salt("mic_device")
-                            .selected_text(
-                                RichText::new(shorten_device(&self.mic_device)).size(12.0),
-                            )
-                            .width(150.0)
-                            .show_ui(ui, |ui| {
-                                for device in self.mic_devices.clone() {
-                                    ui.selectable_value(&mut chosen, device.clone(), device);
-                                }
-                            });
-                        if chosen != self.mic_device {
-                            self.mic_device = chosen;
-                            self.mark_dirty();
-                        }
-                        if ui
-                            .small_button("↻")
-                            .on_hover_text("Look for newly plugged in microphones")
-                            .clicked()
-                        {
-                            self.mic_devices = crate::devices::list_input_devices();
-                            if !self.mic_devices.contains(&self.mic_device) {
-                                self.mic_device = SYSTEM_DEFAULT_LABEL.to_owned();
+                        ui.add_enabled_ui(!starting, |ui| {
+                            let mut chosen = self.mic_device.clone();
+                            egui::ComboBox::from_id_salt("mic_device")
+                                .selected_text(
+                                    RichText::new(shorten_device(&self.mic_device)).size(12.0),
+                                )
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for device in self.mic_devices.clone() {
+                                        ui.selectable_value(&mut chosen, device.clone(), device);
+                                    }
+                                });
+                            if chosen != self.mic_device {
+                                self.mic_device = chosen;
                                 self.mark_dirty();
                             }
-                        }
+                            if ui
+                                .small_button("↻")
+                                .on_hover_text("Look for newly plugged in microphones")
+                                .clicked()
+                            {
+                                self.mic_devices = crate::devices::list_input_devices();
+                                if !self.mic_devices.contains(&self.mic_device) {
+                                    self.mic_device = SYSTEM_DEFAULT_LABEL.to_owned();
+                                    self.mark_dirty();
+                                }
+                            }
+                        });
                         if starting {
-                            // Honest wait state: the device open can take a
-                            // moment (and the watchdog recovers if it wedges).
                             ui.add_enabled_ui(false, |ui| {
                                 ui.add_sized(
                                     [90.0, 26.0],
                                     egui::Button::new(
-                                        RichText::new("● Starting…")
-                                            .size(12.5)
-                                            .color(theme::MUTED),
+                                        RichText::new("● Starting…").size(12.5).color(theme::MUTED),
                                     )
                                     .fill(theme::BG_SOFT)
                                     .corner_radius(CornerRadius::same(8)),
@@ -1012,10 +919,12 @@ impl SoundboardApp {
                         } else if ui
                             .add_sized(
                                 [90.0, 26.0],
-                                Button::new(RichText::new("● Record").size(12.5).color(theme::TEXT))
-                                    .fill(theme::BG_SOFT)
-                                    .stroke(Stroke::new(1.0, theme::BORDER))
-                                    .corner_radius(CornerRadius::same(8)),
+                                Button::new(
+                                    RichText::new("● Record").size(12.5).color(theme::TEXT),
+                                )
+                                .fill(theme::BG_SOFT)
+                                .stroke(Stroke::new(1.0, theme::BORDER))
+                                .corner_radius(CornerRadius::same(8)),
                             )
                             .on_hover_text("Record from the selected microphone into this board")
                             .clicked()
@@ -1035,12 +944,8 @@ impl SoundboardApp {
                                 .size(12.5)
                                 .color(theme::MUTED),
                         );
-                        // Settings (system-tray behaviour).
-                        if ui
-                            .small_button("⚙")
-                            .on_hover_text("Settings")
-                            .clicked()
-                        {
+
+                        if ui.small_button("⚙").on_hover_text("Settings").clicked() {
                             self.settings_open = true;
                         }
                     });
@@ -1048,7 +953,6 @@ impl SoundboardApp {
 
                 ui.add_space(4.0);
 
-                // Board switcher: pick the visible board, or manage boards.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Board").size(13.5).color(theme::MUTED));
                     let before = self.active_board;
@@ -1111,7 +1015,6 @@ impl SoundboardApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        // Expire the toast before drawing the bar.
         if let Some(t) = &self.toast {
             if Instant::now() >= t.until {
                 self.toast = None;
@@ -1126,51 +1029,48 @@ impl SoundboardApp {
             .frame(frame)
             .show_separator_line(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    match &self.hotkey_state {
-                        HotkeyBackendState::Active => {
-                            ui.label(
-                                RichText::new("●  Listening in the background")
-                                    .size(11.5)
-                                    .color(theme::GOOD),
-                            );
-                            ui.label(
-                                RichText::new("— minimize me, hotkeys keep working.")
-                                    .size(11.5)
-                                    .color(theme::MUTED),
-                            );
-                        }
-                        HotkeyBackendState::Starting => {
-                            ui.label(
-                                RichText::new("○  Starting hotkeys…")
-                                    .size(11.5)
-                                    .color(theme::MUTED),
-                            );
-                        }
-                        HotkeyBackendState::Unavailable(reason) => {
-                            ui.label(
-                                RichText::new("⚠  System hotkeys unavailable")
-                                    .size(11.5)
-                                    .color(theme::WARN),
-                            )
-                            .on_hover_text(reason);
-                            ui.label(
-                                RichText::new("— click ▶ to play sounds.")
-                                    .size(11.5)
-                                    .color(theme::MUTED),
-                            );
-                        }
+                ui.horizontal(|ui| match &self.hotkey_state {
+                    HotkeyBackendState::Active => {
+                        ui.label(
+                            RichText::new("●  Listening in the background")
+                                .size(11.5)
+                                .color(theme::GOOD),
+                        );
+                        ui.label(
+                            RichText::new("— minimize me, hotkeys keep working.")
+                                .size(11.5)
+                                .color(theme::MUTED),
+                        );
+                    }
+                    HotkeyBackendState::Starting => {
+                        ui.label(
+                            RichText::new("○  Starting hotkeys…")
+                                .size(11.5)
+                                .color(theme::MUTED),
+                        );
+                    }
+                    HotkeyBackendState::Unavailable(reason) => {
+                        ui.label(
+                            RichText::new("⚠  System hotkeys unavailable")
+                                .size(11.5)
+                                .color(theme::WARN),
+                        )
+                        .on_hover_text(reason);
+                        ui.label(
+                            RichText::new("— click ▶ to play sounds.")
+                                .size(11.5)
+                                .color(theme::MUTED),
+                        );
                     }
                 });
 
-                // The toast gets its own full-width row. Sharing the status
-                // line made long messages (error text, device names) collide
-                // with the status text instead of wrapping below it.
                 if let Some(toast) = &self.toast {
                     ui.add_space(2.0);
                     ui.add(
                         egui::Label::new(
-                            RichText::new(&toast.text).size(12.0).color(toast.kind.colour()),
+                            RichText::new(&toast.text)
+                                .size(12.0)
+                                .color(toast.kind.colour()),
                         )
                         .wrap(),
                     );
@@ -1198,10 +1098,8 @@ impl SoundboardApp {
                             );
                             ui.add_space(6.0);
                             ui.label(
-                                RichText::new(
-                                    "Click \"➕  Add Sound\" to create your first slot.",
-                                )
-                                .color(theme::MUTED),
+                                RichText::new("Click \"➕  Add Sound\" to create your first slot.")
+                                    .color(theme::MUTED),
                             );
                         });
                         return;
@@ -1209,14 +1107,10 @@ impl SoundboardApp {
 
                     ui.spacing_mut().item_spacing.x = SLOT_GAP;
 
-                    // Work out how many tiles fit per row, then draw explicit
-                    // rows. Deterministic layout avoids `horizontal_wrapped`
-                    // quirks (stray scrollbars, uneven row gaps).
                     let avail = ui.available_width();
-                    let columns = (((avail + SLOT_GAP) / (SLOT_W + SLOT_GAP)).floor() as usize)
-                        .max(1);
+                    let columns =
+                        (((avail + SLOT_GAP) / (SLOT_W + SLOT_GAP)).floor() as usize).max(1);
 
-                    // `Some(..)` for each slot, then a trailing `None` = add tile.
                     let mut tiles: Vec<Option<(SlotId, bool, bool)>> = self
                         .active()
                         .slots
@@ -1288,9 +1182,10 @@ impl SoundboardApp {
             });
 
         if accept {
-            // "Move it here": free the key everywhere else first, so one key
-            // always has exactly one owner. ("Use Anyway" just sets it.)
-            debug!("Confirm accepted ({}) for slot={}.", pending.accept, pending.slot);
+            debug!(
+                "Confirm accepted ({}) for slot={}.",
+                pending.accept, pending.slot
+            );
             let freed: Vec<String> = self
                 .active()
                 .slots
@@ -1324,7 +1219,6 @@ impl SoundboardApp {
         }
     }
 
-    /// Render the rename / delete-board modal, if one is open.
     fn board_dialogs(&mut self, ctx: &egui::Context) {
         let mut save_rename: Option<(BoardId, String)> = None;
         let mut close = false;
@@ -1420,16 +1314,6 @@ impl SoundboardApp {
         }
     }
 
-    // --- input ------------------------------------------------------------
-
-    /// While a slot awaits a hotkey, capture the next key press.
-    ///
-    /// Grab suspension (see `suspend_hotkey_grabs`): our own `RegisterHotKey`
-    /// grabs swallow matching presses before `winit`/`egui` ever see them, so
-    /// an already-bound key could never be *re*-recorded — the old sound would
-    /// fire while the badge waited forever. Grabs are therefore dropped when
-    /// recording starts and restored when it ends (capture, cancel, or the
-    /// slot disappearing).
     fn handle_recording(&mut self, ctx: &egui::Context) {
         let Some(id) = self.recording else {
             return;
@@ -1452,12 +1336,7 @@ impl SoundboardApp {
                         cancelled = true;
                         break;
                     }
-                    // Modifiers arrive as their own key presses. Pressing
-                    // Ctrl a moment before K would otherwise capture *Ctrl*
-                    // as the whole binding, ending recording immediately and
-                    // landing a bare-modifier combo that can never be
-                    // grabbed. Keep waiting; the real key carries the
-                    // modifier state in `modifiers`.
+
                     if is_modifier_key(*key) {
                         continue;
                     }
@@ -1482,8 +1361,7 @@ impl SoundboardApp {
             debug!("Recorded key={} for slot={id}.", hotkey.display());
             self.recording = None;
             self.push_hotkey_rebuild();
-            // The toolbar's Stop key records through the same flow, addressed
-            // by its sentinel id.
+
             if id == STOP_ALL_ID {
                 self.guard_stop_hotkey(hotkey);
             } else {
@@ -1492,16 +1370,10 @@ impl SoundboardApp {
         }
     }
 
-    // --- audio events -----------------------------------------------------
-
-    /// Fire-and-forget send to the engine. The channel is unbounded and the
-    /// receiver lives as long as the app, so this cannot block or fail in
-    /// practice; a failure just means the engine is gone (shutdown).
     fn send(&self, cmd: AudioCommand) {
         let _ = self.audio_tx.send(cmd);
     }
 
-    /// Drain every pending engine event. Called once per frame.
     fn poll_audio_events(&mut self) {
         while let Ok(event) = self.audio_rx.try_recv() {
             match event {
@@ -1524,7 +1396,7 @@ impl SoundboardApp {
                     if let Some(slot) = self.find_slot_mut(id) {
                         slot.missing = true;
                     }
-                    // Ungrab it so further presses don't just re-toast.
+
                     self.push_hotkey_rebuild();
                     self.toast(
                         ToastKind::Warn,
@@ -1539,7 +1411,7 @@ impl SoundboardApp {
                         self.testing = false;
                     } else {
                         self.playing.remove(&id);
-                        // Ungrab decode-broken files until the user re-links.
+
                         self.broken.insert(id);
                         self.push_hotkey_rebuild();
                     }
@@ -1551,21 +1423,17 @@ impl SoundboardApp {
                     fallback,
                 } => {
                     if let Some(note) = fallback {
-                        // The chosen device vanished; adopt whatever we opened.
                         if !actual.is_empty() {
                             self.output_device = actual;
                         }
                         self.playing.clear();
                         self.testing = false;
                         self.toast(ToastKind::Warn, note);
-                    } else if requested != SYSTEM_DEFAULT_LABEL && requested != self.output_device
-                    {
+                    } else if requested != SYSTEM_DEFAULT_LABEL && requested != self.output_device {
                         self.output_device = requested;
                     }
                 }
                 AudioEvent::StreamError(message) => {
-                    // Typically a USB/Bluetooth device unplugged mid-playback
-                    // on Windows. The stream is dead; clear the glow and say so.
                     self.playing.clear();
                     self.testing = false;
                     self.toast(ToastKind::Warn, message);
@@ -1574,8 +1442,6 @@ impl SoundboardApp {
         }
     }
 
-    /// Drain every pending hotkey-thread status event. Called once per frame.
-    /// Returns true if anything arrived (caller repaints for the status bar).
     fn poll_hotkey_events(&mut self) -> bool {
         let mut changed = false;
         while let Ok(event) = self.hotkey_rx.try_recv() {
@@ -1599,11 +1465,6 @@ impl SoundboardApp {
         changed
     }
 
-    // --- persistence ------------------------------------------------------
-
-    /// Flag the board for saving. The actual write happens debounced in
-    /// `maybe_autosave` (plus once in `on_exit`), so slider drags and rapid
-    /// clicks collapse into a single atomic write.
     fn mark_dirty(&mut self) {
         self.config_dirty = true;
     }
@@ -1625,50 +1486,41 @@ impl SoundboardApp {
     fn save_now(&mut self) {
         match config::save(&self.snapshot_state()) {
             Ok(()) => {
-                log::info!(
-                    "Saved state ({} boards).",
-                    self.boards.len()
-                );
+                log::info!("Saved state ({} boards).", self.boards.len());
                 self.config_dirty = false;
                 self.last_save = Instant::now();
             }
             Err(err) => {
-                // Keep running; retry on the next mutation. Warn loudly in the
-                // log, once in the UI (no per-frame spam).
                 log::warn!("Could not save config: {err}");
-                self.config_dirty = false;
+                self.config_dirty = true;
                 self.last_save = Instant::now();
                 self.toast(
                     ToastKind::Warn,
-                    "Could not save your soundboard layout. Changes will be lost on exit.",
+                    "Could not save your soundboard layout. The app will keep retrying \
+                     in the background.",
                 );
             }
         }
     }
 
-    /// Flush pending saves at most every 700ms. Called once per frame.
     fn maybe_autosave(&mut self) {
         if self.config_dirty && self.last_save.elapsed() > Duration::from_millis(700) {
             self.save_now();
         }
     }
 
-    /// Drain recorder events. Returns true if anything arrived.
-    /// A saved take becomes a slot on the active board automatically.
-    /// (If the recorder thread ever died, its sender vanishes too, so
-    /// `try_recv` keeps returning an error and this can never block.)
     fn poll_record_events(&mut self) -> bool {
         let mut changed = false;
         while let Ok(event) = self.record_rx.try_recv() {
             changed = true;
-            // Any event means the Start command was consumed: the watchdog
-            // no longer applies.
+
             self.mic_starting = None;
             match event {
                 RecordEvent::Started { device } => {
-                    self.mic = Some(MicTake { started: Instant::now() });
-                    // Naming the device makes "recording silence from the
-                    // wrong endpoint" obvious the moment it happens.
+                    self.mic = Some(MicTake {
+                        started: Instant::now(),
+                    });
+
                     self.toast(ToastKind::Info, format!("Recording from {device}."));
                 }
                 RecordEvent::Saved {
@@ -1684,8 +1536,6 @@ impl SoundboardApp {
                     self.active_mut().slots.push(slot);
                     self.mark_dirty();
                     if cut_short {
-                        // The mic died mid-take: say so rather than implying
-                        // the user stopped it themselves.
                         self.toast(
                             ToastKind::Warn,
                             format!(
@@ -1709,9 +1559,6 @@ impl SoundboardApp {
         changed
     }
 
-
-    // --- apply ------------------------------------------------------------
-
     fn apply(&mut self, action: SlotAction) {
         match action {
             SlotAction::AddViaPicker => {
@@ -1719,14 +1566,7 @@ impl SoundboardApp {
                 self.add_sound_via_picker();
             }
             SlotAction::Play(id) => {
-                // Optimistic highlight: the engine confirms with `Started`
-                // (or corrects us with `FileMissing` / `DecodeError`).
-                let found = self
-                    .active()
-                    .slots
-                    .iter()
-                    .find(|s| s.id == id)
-                    .cloned();
+                let found = self.active().slots.iter().find(|s| s.id == id).cloned();
                 if let Some(slot) = found {
                     if let Some(path) = slot.file_path.clone() {
                         self.playing.insert(id);
@@ -1748,7 +1588,10 @@ impl SoundboardApp {
                 debug!("Arming hotkey record for slot={id}.");
                 self.recording = Some(id);
                 self.suspend_hotkey_grabs();
-                self.toast(ToastKind::Info, "Press the key you want to use (Esc to cancel).");
+                self.toast(
+                    ToastKind::Info,
+                    "Press the key you want to use (Esc to cancel).",
+                );
             }
             SlotAction::ClearHotkey(id) => {
                 if let Some(slot) = self.find_slot_mut(id) {
@@ -1762,10 +1605,11 @@ impl SoundboardApp {
                 self.active_mut().slots.retain(|s| s.id != id);
                 self.playing.remove(&id);
                 self.broken.remove(&id);
+
+                self.waves.invalidate(id);
                 if self.recording == Some(id) {
                     self.recording = None;
-                    // The doomed slot was being recorded: grabs were suspended
-                    // for it, so restore the rest.
+
                     self.push_hotkey_rebuild();
                 }
                 self.send(AudioCommand::Stop(id));
@@ -1780,11 +1624,6 @@ impl SoundboardApp {
         }
     }
 
-    // --- trim editor ------------------------------------------------------
-
-    /// Open the trim editor for a slot. Missing files must be re-linked first
-    /// (there is nothing to preview). Kicks off the background waveform
-    /// decode; the modal shows progress until it lands.
     fn open_editor(&mut self, id: SlotId) {
         let found = self
             .active()
@@ -1803,14 +1642,15 @@ impl SoundboardApp {
                 });
             }
             Some((_, true, _, _)) => {
-                self.toast(ToastKind::Info, "Find the file first (Find Again), then trim it.");
+                self.toast(
+                    ToastKind::Info,
+                    "Find the file first (Find Again), then trim it.",
+                );
             }
             _ => {}
         }
     }
 
-    /// Drain finished waveform decodes. Drops responses for files that were
-    /// re-linked mid-decode. Returns true if anything arrived.
     fn poll_waves(&mut self) -> bool {
         let mut changed = false;
         while let Ok((id, path, result)) = self.waves.rx.try_recv() {
@@ -1829,19 +1669,17 @@ impl SoundboardApp {
         changed
     }
 
-    /// Render the trim editor modal, if open.
     fn editor_dialog(&mut self, ctx: &egui::Context) {
-        let Some(state) = self.editor.clone() else {
+        let Some(slot_id) = self.editor.as_ref().map(|editor| editor.slot) else {
             return;
         };
         let slot = self
             .boards
             .iter()
             .flat_map(|b| b.slots.iter())
-            .find(|s| s.id == state.slot)
+            .find(|s| s.id == slot_id)
             .cloned();
         let Some(slot) = slot else {
-            // Slot deleted while editing.
             self.editor = None;
             return;
         };
@@ -1872,7 +1710,7 @@ impl SoundboardApp {
                 );
                 ui.add_space(8.0);
 
-                match self.waves.ready.get(&state.slot).cloned() {
+                match self.waves.ready.get(&slot_id).cloned() {
                     None => {
                         ui.label(RichText::new("Loading sound…").color(theme::MUTED));
                         ui.add_space(100.0);
@@ -1882,18 +1720,24 @@ impl SoundboardApp {
                         ui.add_space(8.0);
                     }
                     Some(Ok(wave)) => {
-                        let response = draw_waveform(ui, &wave, state.start_frac, state.end_frac);
-                        // Resolve the drag against the live editor state.
+                        let (start_frac, end_frac) = {
+                            let editor = self.editor.as_ref().expect("editor open");
+                            (editor.start_frac, editor.end_frac)
+                        };
+                        let response = draw_waveform(ui, &wave, start_frac, end_frac);
                         if let Some(editor) = self.editor.as_mut() {
                             if response.drag_started() {
-                                let x = response.interact_pointer_pos().map(|p| {
-                                    (p.x - response.rect.left()) / response.rect.width()
-                                });
+                                let x = response
+                                    .interact_pointer_pos()
+                                    .map(|p| (p.x - response.rect.left()) / response.rect.width());
                                 if let Some(x) = x {
                                     let ds = (x - editor.start_frac).abs();
                                     let de = (x - editor.end_frac).abs();
-                                    editor.drag =
-                                        Some(if ds <= de { EditorHandle::Start } else { EditorHandle::End });
+                                    editor.drag = Some(if ds <= de {
+                                        EditorHandle::Start
+                                    } else {
+                                        EditorHandle::End
+                                    });
                                 }
                             }
                             if response.dragged() {
@@ -1905,11 +1749,13 @@ impl SoundboardApp {
                                     .clamp(0.0, 1.0);
                                     match handle {
                                         EditorHandle::Start => {
-                                            editor.start_frac = frac.min(editor.end_frac - MIN_TRIM_GAP);
+                                            editor.start_frac =
+                                                frac.min(editor.end_frac - MIN_TRIM_GAP);
                                             editor.start_frac = editor.start_frac.max(0.0);
                                         }
                                         EditorHandle::End => {
-                                            editor.end_frac = frac.max(editor.start_frac + MIN_TRIM_GAP);
+                                            editor.end_frac =
+                                                frac.max(editor.start_frac + MIN_TRIM_GAP);
                                             editor.end_frac = editor.end_frac.min(1.0);
                                         }
                                     }
@@ -1920,7 +1766,7 @@ impl SoundboardApp {
                             }
                         }
 
-                        let (start, end) = (state.start_frac, state.end_frac);
+                        let (start, end) = (start_frac, end_frac);
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label(
@@ -1952,8 +1798,7 @@ impl SoundboardApp {
                     }
                 }
 
-                // Error state still needs a way out.
-                if !matches!(self.waves.ready.get(&state.slot), Some(Ok(_))) {
+                if !matches!(self.waves.ready.get(&slot_id), Some(Ok(_))) {
                     ui.horizontal(|ui| {
                         if ui.button("Close").clicked() {
                             close = true;
@@ -1972,10 +1817,11 @@ impl SoundboardApp {
             }
         }
         if preview {
-            self.preview_trim(state.slot, state.start_frac, state.end_frac);
+            let editor = self.editor.as_ref().expect("editor open");
+            self.preview_trim(slot_id, editor.start_frac, editor.end_frac);
         }
         if let Some((start, end, duration)) = save {
-            if let Some(slot) = self.find_slot_mut(state.slot) {
+            if let Some(slot) = self.find_slot_mut(slot_id) {
                 slot.trim_start = start;
                 slot.trim_end = end;
                 slot.duration_secs = Some(duration);
@@ -1987,7 +1833,6 @@ impl SoundboardApp {
         }
     }
 
-    /// Play the editor's current bounds (not yet saved) for preview.
     fn preview_trim(&mut self, id: SlotId, start_frac: f32, end_frac: f32) {
         let duration_secs = match self.waves.ready.get(&id).cloned() {
             Some(Ok(wave)) => wave.duration_secs,
@@ -2015,18 +1860,7 @@ impl SoundboardApp {
             });
         }
     }
-    // --- file picking -------------------------------------------------------
-    //
-    // `rfd` shows the *native* dialog on each OS (Win32 picker on Windows,
-    // portal on this Linux dev box). Same call, no `cfg` needed — which is
-    // exactly why the Windows target can be developed from Linux here.
 
-    /// The native "choose a sound" dialog. `None` = the user cancelled.
-    ///
-    /// Note: `.opus` is deliberately absent. `rodio 0.23` ships no Opus codec
-    /// (only mp3/wav/vorbis-ogg/flac/aac), so offering it would be a lie —
-    /// every pick would end in a decode-error toast. Revisit if upstream adds
-    /// Opus or we add a dedicated Opus pipeline (a later-phase option).
     fn pick_sound_file() -> Option<PathBuf> {
         rfd::FileDialog::new()
             .set_title("Choose a sound")
@@ -2034,7 +1868,6 @@ impl SoundboardApp {
             .pick_file()
     }
 
-    /// Friendly tile name from a path: `party-horn.mp3` → `party-horn`.
     fn display_name_for(path: &std::path::Path) -> String {
         path.file_stem()
             .and_then(|stem| stem.to_str())
@@ -2043,88 +1876,70 @@ impl SoundboardApp {
             .unwrap_or_else(|| "Sound".to_owned())
     }
 
-    /// Fill an existing slot from the picker (new sound or re-link).
     fn fill_slot_via_picker(&mut self, id: SlotId) {
         let Some(path) = Self::pick_sound_file() else {
-            return; // cancelled — leave the slot untouched
+            return;
         };
         let name = Self::display_name_for(&path);
         if let Some(slot) = self.find_slot_mut(id) {
             slot.name = name.clone();
             slot.file_path = Some(path);
             slot.missing = false;
-            // A new file means new audio: old trim bounds, duration, and
-            // waveform no longer describe this slot.
+
             slot.clear_trim();
         }
         self.waves.invalidate(id);
-        // Re-linking clears any decode-broken flag and re-arms the grab.
+
         self.broken.remove(&id);
         self.push_hotkey_rebuild();
-        self.toast(ToastKind::Good, format!("Added \"{name}\". Click ▶ to hear it."));
+        self.toast(
+            ToastKind::Good,
+            format!("Added \"{name}\". Click ▶ to hear it."),
+        );
     }
 
-    /// "Add Sound" flow: pick a file first, then append a filled slot.
-    /// Cancelling the dialog adds nothing (no stray empty tiles).
     fn add_sound_via_picker(&mut self) {
         let Some(path) = Self::pick_sound_file() else {
             return;
         };
         let name = Self::display_name_for(&path);
         let id = self.alloc_id();
-        self.active_mut().slots.push(SoundSlot::with_file(id, name.clone(), path));
-        self.toast(ToastKind::Good, format!("Added \"{name}\". Click ▶ to hear it."));
+        self.active_mut()
+            .slots
+            .push(SoundSlot::with_file(id, name.clone(), path));
+        self.toast(
+            ToastKind::Good,
+            format!("Added \"{name}\". Click ▶ to hear it."),
+        );
     }
 
-    /// Decide when the next frame is needed, instead of spinning.
-    ///
-    /// Unconditional `request_repaint()` per frame pegs a CPU core (measured
-    /// 1000+ FPS on the dev box). Each reason below declares the slowest rate
-    /// at which it still looks right, and we take the fastest requirement:
-    ///
-    /// - a tile glow pulse animates, so ~30 FPS is plenty;
-    /// - the recording timer shows tenths of a second, so 10 FPS is enough;
-    /// - a toast only needs *one* wake-up, when it expires;
-    /// - the mic-start watchdog needs one wake-up, at its deadline.
     fn schedule_repaint(&self, ctx: &egui::Context) {
-        // Every reason below schedules its own deadline, and they all apply:
-        // egui keeps the *earliest* pending repaint (`repaint_delay` is only
-        // lowered, never raised), so no early `return` — one would silently
-        // shadow another reason's wake-up. Example that bit: a toast on
-        // screen during a mic start would return first and drop the watchdog
-        // deadline, so the watchdog could only fire on some later, unrelated
-        // repaint.
-
-        // Animated glow on playing tiles: smooth enough at 30 FPS.
         if !self.playing.is_empty() || self.testing {
             ctx.request_repaint_after(TILE_ANIMATION_FRAME);
         }
-        // Live take timer (`0:03.2`): 10 FPS reads as continuous.
+
         if self.mic.is_some() {
             ctx.request_repaint_after(TIMER_FRAME);
         }
-        // Toast: wake once, when it is due to disappear.
+
         if let Some(toast) = &self.toast {
             let remaining = toast.until.saturating_duration_since(Instant::now());
             if remaining > Duration::ZERO {
                 ctx.request_repaint_after(remaining);
             }
         }
-        // Mic-start watchdog: wake once, at its deadline.
+
         if let Some(since) = self.mic_starting {
             let remaining = MIC_START_TIMEOUT.saturating_sub(since.elapsed());
             ctx.request_repaint_after(remaining);
         }
     }
-
 }
 
 impl eframe::App for SoundboardApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Everything with a side effect (polling threads, tray, timers,
-        // autosave) already ran in `logic`. This pass only paints.
         let mut actions: Vec<SlotAction> = Vec::new();
 
         self.top_bar(ui);
@@ -2141,13 +1956,6 @@ impl eframe::App for SoundboardApp {
         }
     }
 
-    /// Runs before every `ui` pass **and** while the window is hidden.
-    ///
-    /// This split is what makes the tray usable: eframe skips the whole egui
-    /// pass for a hidden viewport (`ui` is never called), so a tray click
-    /// handled from inside `ui` could never unhide the window — the app would
-    /// be permanently stuck in the tray. `logic` is the documented hook for
-    /// exactly this, and it must not paint, which is why nothing below draws.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_audio_events();
         if self.poll_hotkey_events() {
@@ -2160,11 +1968,6 @@ impl eframe::App for SoundboardApp {
             ctx.request_repaint();
         }
 
-        // Watchdog: a `Start` that gets no answer within 8s means the device
-        // open wedged inside cpal (activation has its own 5s timeout; this
-        // covers any other blocking call). The old recorder thread is
-        // abandoned — its channels die with it — and a fresh one makes the
-        // Record button work again instead of dead-ending forever.
         if let Some(since) = self.mic_starting {
             if since.elapsed() > MIC_START_TIMEOUT {
                 log::warn!("Mic start timed out; restarting the recorder thread.");
@@ -2181,13 +1984,8 @@ impl eframe::App for SoundboardApp {
             }
         }
 
-        // Tray: click/menu events, and the close-to-tray interception. This
-        // MUST be here rather than in `ui`, or a hidden window could never be
-        // reopened (see the doc comment above).
         self.handle_tray(ctx);
 
-        // Hotkey recording needs real input events, which only exist for a
-        // shown window; skipping it here is correct, not an oversight.
         if self.window_visible {
             self.handle_recording(ctx);
         }
@@ -2196,8 +1994,6 @@ impl eframe::App for SoundboardApp {
         self.maybe_autosave();
     }
 
-    /// Flush unsaved changes on the way out so the last 700ms window is never
-    /// lost on a deliberate quit.
     fn on_exit(&mut self) {
         if self.config_dirty {
             self.save_now();
@@ -2205,20 +2001,18 @@ impl eframe::App for SoundboardApp {
     }
 }
 
-// --- drawing helpers ------------------------------------------------------
-
-/// Minimum kept slice, as a fraction (keeps the handles from crossing).
 const MIN_TRIM_GAP: f32 = 0.02;
 
-/// Editor canvas geometry.
 const WAVE_W: f32 = 300.0;
 const WAVE_H: f32 = 110.0;
 
-/// Paint the waveform with shaded cut-aways and start/end handles.
-/// Returns the response for drag handling by the caller.
-fn draw_waveform(ui: &mut egui::Ui, wave: &Waveform, start_frac: f32, end_frac: f32) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(WAVE_W, WAVE_H), Sense::drag());
+fn draw_waveform(
+    ui: &mut egui::Ui,
+    wave: &Waveform,
+    start_frac: f32,
+    end_frac: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(WAVE_W, WAVE_H), Sense::drag());
 
     ui.painter().rect(
         rect,
@@ -2232,7 +2026,6 @@ fn draw_waveform(ui: &mut egui::Ui, wave: &Waveform, start_frac: f32, end_frac: 
     let half_h = rect.height() / 2.0 - 8.0;
     let x_of = |frac: f32| rect.left() + frac.clamp(0.0, 1.0) * rect.width();
 
-    // Peaks, one segment per bucket; dimmed outside the kept range.
     let mut kept: Vec<[egui::Pos2; 2]> = Vec::new();
     let mut cut: Vec<[egui::Pos2; 2]> = Vec::new();
     for (i, (min, max)) in wave.peaks.iter().enumerate() {
@@ -2248,13 +2041,14 @@ fn draw_waveform(ui: &mut egui::Ui, wave: &Waveform, start_frac: f32, end_frac: 
         }
     }
     for segment in cut {
-        ui.painter().line_segment(segment, Stroke::new(1.0, theme::MUTED));
+        ui.painter()
+            .line_segment(segment, Stroke::new(1.0, theme::MUTED));
     }
     for segment in kept {
-        ui.painter().line_segment(segment, Stroke::new(1.0, theme::TEXT));
+        ui.painter()
+            .line_segment(segment, Stroke::new(1.0, theme::TEXT));
     }
 
-    // Handles: blue edge bars at the kept boundaries.
     for frac in [start_frac, end_frac] {
         let x = x_of(frac);
         ui.painter().rect(
@@ -2272,11 +2066,6 @@ fn draw_waveform(ui: &mut egui::Ui, wave: &Waveform, start_frac: f32, end_frac: 
     response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
 }
 
-/// Is this key press just a modifier going down on its own?
-///
-/// While recording a binding, Ctrl/Shift/Alt/Super are held *before* the real
-/// key, so egui delivers their press events first. They must not be captured
-/// as the binding itself — the real key carries the state in `modifiers`.
 fn is_modifier_key(key: egui::Key) -> bool {
     use egui::Key::*;
     matches!(
@@ -2292,14 +2081,11 @@ fn is_modifier_key(key: egui::Key) -> bool {
     )
 }
 
-/// Seconds as `M:SS.d` (e.g. `0:03.2`).
 fn fmt_time(secs: f32) -> String {
     let secs = secs.max(0.0);
     format!("{}:{:04.1}", secs as u32 / 60, secs % 60.0)
 }
 
-/// Shorten a device name for the compact mic picker.
-/// `Speakers (Realtek(R) Audio)` → `Speakers (Realtek(R…)`. Full name in hover.
 fn shorten_device(name: &str) -> String {
     let max = 22;
     if name.chars().count() <= max {
@@ -2317,9 +2103,6 @@ fn draw_slot(
 ) -> Option<SlotAction> {
     let mut action: Option<SlotAction> = None;
 
-    // Reserve the tile's space *exactly*, then paint and lay out inside that
-    // rect. This keeps the wrapped grid perfectly aligned (a `Frame` sized to
-    // its content staggers tiles inside `horizontal_wrapped`).
     let (rect, response) = ui.allocate_exact_size(Vec2::new(SLOT_W, SLOT_H), Sense::hover());
 
     let (fill, stroke) = slot_colors(ui, slot, playing, recording);
@@ -2338,7 +2121,6 @@ fn draw_slot(
             .max_rect(inner)
             .layout(Layout::top_down(Align::Min)),
         |ui| {
-            // Header: name + edit + remove.
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(ellipsize(&slot.name, 14))
@@ -2385,7 +2167,11 @@ fn draw_slot(
                 }
             } else {
                 let label = if playing { "⏹   Stop" } else { "▶   Play" };
-                let fill = if playing { theme::GOOD_SOFT } else { theme::ACCENT };
+                let fill = if playing {
+                    theme::GOOD_SOFT
+                } else {
+                    theme::ACCENT
+                };
                 let width = ui.available_width();
                 if ui
                     .add_sized(
@@ -2406,10 +2192,8 @@ fn draw_slot(
 
             ui.add_space(6.0);
 
-            // Hotkey badge: click to (re)bind, right-click to clear.
             let badge = hotkey_badge(ui, slot, recording);
             if recording {
-                // Ignore clicks while we wait for a key press.
             } else if badge.clicked() {
                 action = Some(SlotAction::StartRecording(slot.id));
             } else if badge.secondary_clicked() && slot.hotkey.is_some() {
@@ -2482,11 +2266,7 @@ fn draw_add_tile(ui: &mut egui::Ui, actions: &mut Vec<SlotAction>) {
             ui.add_space(26.0);
             ui.label(RichText::new("➕").size(26.0).color(theme::ACCENT));
             ui.add_space(2.0);
-            ui.label(
-                RichText::new("Add Sound")
-                    .size(13.0)
-                    .color(theme::MUTED),
-            );
+            ui.label(RichText::new("Add Sound").size(13.0).color(theme::MUTED));
         },
     );
 
@@ -2496,8 +2276,6 @@ fn draw_add_tile(ui: &mut egui::Ui, actions: &mut Vec<SlotAction>) {
     response.on_hover_cursor(egui::CursorIcon::PointingHand);
 }
 
-/// Pick the tile's fill + border from its state, with a pulsing green border
-/// while it is playing.
 fn slot_colors(
     ui: &egui::Ui,
     slot: &SoundSlot,
@@ -2519,8 +2297,6 @@ fn slot_colors(
     (theme::BG_SOFT, Stroke::new(1.0, theme::BORDER))
 }
 
-/// Trim snapshot for playback commands: `Some` only when the slot is actually
-/// trimmed *and* its exact duration is known. Otherwise the engine plays whole.
 fn trim_spec_for(slot: &SoundSlot) -> Option<TrimSpec> {
     let duration_secs = slot.duration_secs?;
     if !slot.is_trimmed() {
@@ -2533,12 +2309,61 @@ fn trim_spec_for(slot: &SoundSlot) -> Option<TrimSpec> {
     })
 }
 
-/// Trim a long name to `max` characters with an ellipsis.
 fn ellipsize(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_owned()
     } else {
         let truncated: String = text.chars().take(max.saturating_sub(1)).collect();
         format!("{truncated}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_time_formats_minutes_seconds_and_tenths() {
+        assert_eq!(fmt_time(0.0), "0:00.0");
+        assert_eq!(fmt_time(3.2), "0:03.2");
+        assert_eq!(fmt_time(65.0), "1:05.0");
+        assert_eq!(fmt_time(123.4), "2:03.4");
+
+        assert_eq!(fmt_time(-5.0), "0:00.0");
+    }
+
+    #[test]
+    fn ellipsize_truncates_with_ellipsis() {
+        assert_eq!(ellipsize("short", 10), "short");
+        assert_eq!(ellipsize("longer-than-max", 10), "longer-th…");
+        assert_eq!(ellipsize("a", 1), "a");
+        assert_eq!(ellipsize("ab", 1), "…");
+    }
+
+    #[test]
+    fn shorten_device_caps_at_22_chars() {
+        assert_eq!(shorten_device("Mic"), "Mic");
+        let long = "Speakers (Realtek(R) Audio)";
+        let out = shorten_device(long);
+        assert!(out.chars().count() <= 22);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn trim_spec_for_returns_none_when_untrimmed_or_no_duration() {
+        let slot = SoundSlot::with_file(1, "x", "/x.mp3");
+        assert!(trim_spec_for(&slot).is_none());
+
+        let mut trimmed = SoundSlot::with_file(2, "y", "/y.mp3");
+        trimmed.trim_start = 0.25;
+        trimmed.trim_end = 0.75;
+
+        assert!(trim_spec_for(&trimmed).is_none());
+
+        trimmed.duration_secs = Some(8.0);
+        let spec = trim_spec_for(&trimmed).unwrap();
+        assert!((spec.start_frac - 0.25).abs() < f32::EPSILON);
+        assert!((spec.end_frac - 0.75).abs() < f32::EPSILON);
+        assert!((spec.duration_secs - 8.0).abs() < f32::EPSILON);
     }
 }

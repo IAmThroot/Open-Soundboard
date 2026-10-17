@@ -1,22 +1,10 @@
-//! Core data model for Open Soundboard.
-//!
-//! These types are intentionally decoupled from `egui` and already `Serialize`/
-//! `Deserialize`-ready so that Phase 4 (persistence) can save them as-is.
-//! Nothing here touches audio or the OS — Phase 1 is pure state + layout.
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Stable identity for a slot, independent of its grid position.
-/// Unique across *all* boards so ids never collide on switches or merges.
 pub type SlotId = u64;
 
-/// Stable identity for a board.
 pub type BoardId = u64;
 
-/// One board: a named grid of sound slots. Hotkeys are scoped per board —
-/// the same key may mean different sounds on different boards, because only
-/// the active board's bindings are ever grabbed OS-wide.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Board {
     pub id: BoardId,
@@ -35,11 +23,6 @@ impl Board {
     }
 }
 
-/// A keyboard shortcut the user bound to a slot, e.g. `Ctrl+Shift+K`.
-///
-/// `key` stores the human-readable key label (see `egui::Key::name()`), e.g.
-/// `"F6"`, `"K"`, `"Space"`. Phase 3 will map this label back to a physical
-/// key code when registering the global hotkey.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Hotkey {
     pub ctrl: bool,
@@ -50,8 +33,6 @@ pub struct Hotkey {
 }
 
 impl Hotkey {
-    /// A bare key with no modifiers, e.g. `F6`.
-    /// Currently only exercised by tests; kept as the obvious constructor.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn simple(key: impl Into<String>) -> Self {
         Self {
@@ -63,7 +44,6 @@ impl Hotkey {
         }
     }
 
-    /// Human-friendly rendering used on the slot badge, e.g. `Ctrl+Shift+K`.
     pub fn display(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         if self.ctrl {
@@ -75,9 +55,7 @@ impl Hotkey {
         if self.shift {
             parts.push("Shift");
         }
-        // The Windows key. `global-hotkey` calls the flag `mac_cmd` because
-        // its API is cross-platform, but this app ships on Windows only, so
-        // the badge must say what the user actually pressed.
+
         if self.mac_cmd {
             parts.push("Win");
         }
@@ -89,9 +67,6 @@ impl Hotkey {
         }
     }
 
-    /// True when this binding would fire while the user is simply typing in
-    /// another app (no modifier + a normal character key). We warn before
-    /// accepting these.
     pub fn looks_like_typing(&self) -> bool {
         if self.ctrl || self.alt || self.mac_cmd {
             return false;
@@ -100,42 +75,43 @@ impl Hotkey {
     }
 }
 
-/// Function keys are safe to use on their own; almost everything else steals
-/// normal typing.
 fn is_safe_standalone_key(label: &str) -> bool {
-    match label.strip_prefix('F') {
-        Some(number) => number
+    match label {
+        label if label.starts_with('F') => label[1..]
             .parse::<u8>()
-            .map(|n| (1..=24).contains(&n))
-            .unwrap_or(false),
-        None => false,
+            .is_ok_and(|n| (1..=24).contains(&n)),
+
+        "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "Home" | "End" | "PageUp"
+        | "PageDown" | "Insert" | "Delete" | "Escape" | "NumLock" | "CapsLock" | "ScrollLock"
+        | "Pause" | "PrintScreen" | "MediaPlayPause" | "MediaStop" | "MediaTrackNext"
+        | "MediaTrackPrevious" | "AudioVolumeDown" | "AudioVolumeMute" | "AudioVolumeUp"
+        | "BrowserBack" | "BrowserForward" | "BrowserRefresh" | "BrowserHome" | "BrowserSearch"
+        | "BrowserStop" | "LaunchApp1" | "LaunchApp2" | "LaunchMail" | "ContextMenu" | "Help" => {
+            true
+        }
+        _ => false,
     }
 }
 
-/// One sound tile on the board.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SoundSlot {
     pub id: SlotId,
-    /// Friendly name shown on the tile (filename without extension).
+
     pub name: String,
-    /// `None` means the tile is empty and waiting for the user to pick a file.
+
     #[serde(default)]
     pub file_path: Option<PathBuf>,
     #[serde(default)]
     pub hotkey: Option<Hotkey>,
-    /// Set when a previously configured file can no longer be found on disk.
+
     #[serde(default)]
     pub missing: bool,
-    /// Trim bounds as fractions of the total sound (0.0–1.0). Playback skips
-    /// everything outside `[trim_start, trim_end]`. Old configs lack these and
-    /// default to the full sound.
+
     #[serde(default)]
     pub trim_start: f32,
     #[serde(default = "default_trim_end")]
     pub trim_end: f32,
-    /// Exact sound length in seconds, measured during waveform decoding.
-    /// Persisted so trimmed playback works on the first press after a restart
-    /// without re-decoding. `None` = unknown (plays full).
+
     #[serde(default)]
     pub duration_secs: Option<f32>,
 }
@@ -145,12 +121,10 @@ fn default_trim_end() -> f32 {
 }
 
 impl SoundSlot {
-    /// True when the trim actually cuts something off.
     pub fn is_trimmed(&self) -> bool {
         self.trim_start > 0.0 || self.trim_end < 1.0
     }
 
-    /// Forget trim edits (used when the file is re-linked).
     pub fn clear_trim(&mut self) {
         self.trim_start = 0.0;
         self.trim_end = 1.0;
@@ -159,7 +133,6 @@ impl SoundSlot {
 }
 
 impl SoundSlot {
-    /// A tile that points at a real file.
     pub fn with_file(id: SlotId, name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         Self {
             id,
@@ -190,9 +163,6 @@ mod tests {
         assert_eq!(hotkey.display(), "Ctrl+Shift+K");
     }
 
-    /// The Windows key is labelled `mac_cmd` by `global-hotkey`'s
-    /// cross-platform API, but this app ships on Windows only — the badge
-    /// must say what the user actually pressed.
     #[test]
     fn windows_key_badge_says_win_not_cmd() {
         let hotkey = Hotkey {
@@ -221,5 +191,65 @@ mod tests {
             key: "J".to_owned(),
         };
         assert!(!hotkey.looks_like_typing());
+    }
+
+    #[test]
+    fn plain_letters_and_digits_look_like_typing() {
+        assert!(Hotkey::simple("K").looks_like_typing());
+        assert!(Hotkey::simple("7").looks_like_typing());
+        assert!(Hotkey::simple("Space").looks_like_typing());
+    }
+
+    #[test]
+    fn non_text_keys_do_not_look_like_typing() {
+        for key in [
+            "F1",
+            "F6",
+            "F24",
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Insert",
+            "Delete",
+            "Escape",
+            "NumLock",
+            "CapsLock",
+            "ScrollLock",
+            "Pause",
+            "PrintScreen",
+            "MediaPlayPause",
+            "MediaStop",
+            "MediaTrackNext",
+            "MediaTrackPrevious",
+            "AudioVolumeDown",
+            "AudioVolumeMute",
+            "AudioVolumeUp",
+            "BrowserBack",
+            "BrowserRefresh",
+            "LaunchApp1",
+            "LaunchMail",
+            "ContextMenu",
+            "Help",
+        ] {
+            assert!(
+                !Hotkey::simple(key).looks_like_typing(),
+                "{key} should be safe as a standalone hotkey",
+            );
+        }
+    }
+
+    #[test]
+    fn modifiers_override_typing_risk() {
+        assert!(Hotkey::simple("k").looks_like_typing());
+        let with_ctrl = Hotkey {
+            ctrl: true,
+            ..Hotkey::simple("k")
+        };
+        assert!(!with_ctrl.looks_like_typing());
     }
 }
