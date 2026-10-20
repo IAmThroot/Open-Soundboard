@@ -49,7 +49,16 @@ pub enum RecordEvent {
     Saved {
         path: PathBuf,
         duration_secs: f32,
-        cut_short: bool,
+
+        /// The recording hit `MAX_RECORDING` and was stopped automatically.
+        capped: bool,
+
+        /// Input chunks the audio callback had to drop because the writer was
+        /// too slow; the take may have gaps.
+        dropped_chunks: u64,
+
+        /// The microphone stream died mid-take; what was captured was kept.
+        stream_died: bool,
     },
     Failed(String),
 }
@@ -119,6 +128,27 @@ fn stamp_name_in(dir: &std::path::Path) -> String {
 fn stamp_name() -> String {
     let dir = recordings_dir().unwrap_or_else(|_| PathBuf::from("."));
     stamp_name_in(&dir)
+}
+
+/// Writes one input chunk, returning `true` when the take reached its sample
+/// cap. Write failures are reported instead of silently truncating the file.
+fn write_chunk<W: std::io::Write + std::io::Seek>(
+    writer: &mut hound::WavWriter<W>,
+    chunk: &[f32],
+    total_samples: &mut usize,
+    max_samples: usize,
+) -> Result<bool, String> {
+    for &sample in chunk {
+        if *total_samples >= max_samples {
+            return Ok(true);
+        }
+        let sample = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        writer
+            .write_sample(sample)
+            .map_err(|err| format!("Could not write the recording (is the disk full?): {err}"))?;
+        *total_samples += 1;
+    }
+    Ok(false)
 }
 
 fn run_recorder(
@@ -320,6 +350,7 @@ fn record_once(
         .saturating_mul(channels as usize);
     let mut total_samples = 0usize;
     let mut capped = false;
+    let mut write_error: Option<String> = None;
     let mut ui_gone = false;
     let began = Instant::now();
 
@@ -343,39 +374,35 @@ fn record_once(
             break;
         }
         while let Ok(chunk) = chunk_rx.try_recv() {
-            for &s in &chunk {
-                if total_samples >= max_samples {
+            match write_chunk(&mut writer, &chunk, &mut total_samples, max_samples) {
+                Ok(true) => {
                     capped = true;
                     break;
                 }
-                let clamped = s.clamp(-1.0, 1.0);
-                let sample = (clamped * i16::MAX as f32) as i16;
-                let _ = writer.write_sample(sample);
-                total_samples += 1;
-            }
-            if capped {
-                break;
+                Ok(false) => {}
+                Err(err) => {
+                    write_error = Some(err);
+                    break;
+                }
             }
         }
-        if capped {
+        if capped || write_error.is_some() {
             break;
         }
     }
 
-    if !ui_gone {
+    if !ui_gone && write_error.is_none() {
         while let Ok(chunk) = chunk_rx.try_recv() {
-            for &s in &chunk {
-                if total_samples >= max_samples {
+            match write_chunk(&mut writer, &chunk, &mut total_samples, max_samples) {
+                Ok(true) => {
                     capped = true;
                     break;
                 }
-                let clamped = s.clamp(-1.0, 1.0);
-                let sample = (clamped * i16::MAX as f32) as i16;
-                let _ = writer.write_sample(sample);
-                total_samples += 1;
-            }
-            if capped {
-                break;
+                Ok(false) => {}
+                Err(err) => {
+                    write_error = Some(err);
+                    break;
+                }
             }
         }
     }
@@ -389,9 +416,16 @@ fn record_once(
         return;
     }
 
+    if let Some(message) = write_error {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        emit(RecordEvent::Failed(message));
+        return;
+    }
+
     let dropped = dropped.load(std::sync::atomic::Ordering::Relaxed);
     if dropped > 0 {
-        warn!("Dropped {dropped} mic chunks (UI thread lag); recording has gaps.");
+        warn!("Dropped {dropped} mic chunks (writer fell behind); recording has gaps.");
     }
 
     let death = death_reason(&died);
@@ -423,14 +457,15 @@ fn record_once(
         info!("Recording hit the 10-minute cap; auto-stopped.");
     }
 
-    let cut_short = death.is_some() || dropped > 0;
     let frames = total_samples / channels.max(1) as usize;
     let duration_secs = frames as f32 / sample_rate as f32;
     info!("Recording saved: {} ({duration_secs:.1}s).", path.display());
     emit(RecordEvent::Saved {
         path,
         duration_secs,
-        cut_short,
+        capped,
+        dropped_chunks: dropped,
+        stream_died: death.is_some(),
     });
 }
 
@@ -479,6 +514,32 @@ mod tests {
             .map(|s| s.unwrap())
             .collect();
         assert_eq!(back, vec![32767, -32767, 0]);
+    }
+
+    #[test]
+    fn writer_stops_at_the_sample_cap() {
+        let dir = std::env::temp_dir().join("open-soundboard-record-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cap.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        let mut total = 0usize;
+
+        assert!(write_chunk(&mut writer, &[0.5; 4], &mut total, 3).unwrap());
+        assert_eq!(total, 3);
+        writer.finalize().unwrap();
+
+        let written = hound::WavReader::open(&path)
+            .unwrap()
+            .samples::<i16>()
+            .count();
+        assert_eq!(written, 3);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

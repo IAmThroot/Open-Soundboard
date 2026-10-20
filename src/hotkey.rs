@@ -63,6 +63,10 @@ pub struct PressTarget {
 #[derive(Debug)]
 pub enum HotkeyCommand {
     Rebuild(Vec<HotkeyBinding>),
+
+    /// The audio engine was restarted and now listens on a new channel. The
+    /// listener keeps the newest sender so presses never target a dead engine.
+    SetAudio(Sender<AudioCommand>),
 }
 
 #[derive(Debug)]
@@ -71,7 +75,15 @@ pub enum HotkeyEvent {
 
     Unavailable(String),
 
-    KeyRejected { display: String, reason: String },
+    KeyRejected {
+        display: String,
+        reason: String,
+    },
+
+    /// A press could not be delivered because the audio engine died. The UI
+    /// restarts the engine (which also sends `HotkeyCommand::SetAudio`) and
+    /// retries this command, so the press isn't lost.
+    AudioUnavailable(AudioCommand),
 }
 
 pub fn spawn_hotkey_thread(
@@ -198,7 +210,7 @@ fn unsuitable_key_reason(label: &str) -> String {
 fn run_listener(
     cmd_rx: Receiver<HotkeyCommand>,
     event_tx: Sender<HotkeyEvent>,
-    audio_tx: Sender<AudioCommand>,
+    mut audio_tx: Sender<AudioCommand>,
     ctx: egui::Context,
 ) {
     let manager = match GlobalHotKeyManager::new() {
@@ -227,7 +239,17 @@ fn run_listener(
             // M7: No hotkeys registered; completely sleep until a UI command arrives
             match cmd_rx.recv() {
                 Ok(HotkeyCommand::Rebuild(bindings)) => {
-                    rebuild(&manager, &event_tx, &ctx, &mut grabbed, &mut routing, bindings);
+                    rebuild(
+                        &manager,
+                        &event_tx,
+                        &ctx,
+                        &mut grabbed,
+                        &mut routing,
+                        bindings,
+                    );
+                }
+                Ok(HotkeyCommand::SetAudio(tx)) => {
+                    audio_tx = tx;
                 }
                 Err(_) => {
                     info!("UI hung up; hotkey listener shutting down.");
@@ -243,19 +265,34 @@ fn run_listener(
             if event.state() != HotKeyState::Pressed {
                 continue;
             }
-            let sent = dispatch_press(&routing, event.id(), &audio_tx);
+            let (sent, lost) = dispatch_press(&routing, event.id(), &audio_tx, &event_tx);
             if sent > 0 {
                 debug!(
                     "Global hotkey id={} pressed; dispatched Play to {sent} slot(s).",
                     event.id()
                 );
             }
+            if lost {
+                // Wake the UI so it can restart the engine and retry the lost
+                // press (it will also send us a fresh audio sender).
+                ctx.request_repaint();
+            }
         }
 
         match cmd_rx.try_recv() {
             Ok(HotkeyCommand::Rebuild(bindings)) => {
-                rebuild(&manager, &event_tx, &ctx, &mut grabbed, &mut routing, bindings);
+                rebuild(
+                    &manager,
+                    &event_tx,
+                    &ctx,
+                    &mut grabbed,
+                    &mut routing,
+                    bindings,
+                );
                 continue;
+            }
+            Ok(HotkeyCommand::SetAudio(tx)) => {
+                audio_tx = tx;
             }
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 info!("UI hung up; hotkey listener shutting down.");
@@ -331,22 +368,37 @@ fn rebuild(
         sent_event = true;
     }
 
-    for (key, slots) in by_key {
+    // A binding can map to more than one physical key (for example "7" grabs
+    // both Digit7 and Numpad7). Only report the binding as rejected when none
+    // of its keys could be registered, so the UI badge stays truthful.
+    let mut succeeded_labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failed_labels: Vec<(String, String)> = Vec::new();
+
+    for (key, group) in by_key {
         match manager.register(key) {
             Ok(()) => {
-                routing.insert(key.id(), slots);
+                for label in &group.labels {
+                    succeeded_labels.insert(label.clone());
+                }
+                routing.insert(key.id(), group.targets);
                 grabbed.push(key);
             }
             Err(err) => {
-                let _ = event_tx.send(HotkeyEvent::KeyRejected {
-                    display: key_to_display(&key),
-                    reason: format!(
-                        "Another program is already using it, or Windows refused it ({err}). \
-                         Pick a different key."
-                    ),
-                });
-                sent_event = true;
+                let reason = format!(
+                    "Another program is already using it, or Windows refused it ({err}). \
+                     Pick a different key."
+                );
+                for label in group.labels {
+                    failed_labels.push((label, reason.clone()));
+                }
             }
+        }
+    }
+
+    for (display, reason) in failed_labels {
+        if !succeeded_labels.contains(&display) {
+            let _ = event_tx.send(HotkeyEvent::KeyRejected { display, reason });
+            sent_event = true;
         }
     }
 
@@ -356,16 +408,31 @@ fn rebuild(
     info!("Hotkey rebuild complete: {} OS grabs.", grabbed.len());
 }
 
-type GroupedBindings = (HashMap<GlobalKey, Vec<PressTarget>>, Vec<(String, String)>);
+type GroupedBindings = (HashMap<GlobalKey, BindingGroup>, Vec<(String, String)>);
+
+/// All bindings that share one physical OS grab. `labels` are the user-facing
+/// `Hotkey::display()` values, which is what the UI matches rejections against.
+struct BindingGroup {
+    labels: Vec<String>,
+    targets: Vec<PressTarget>,
+}
 
 fn group_bindings(bindings: Vec<HotkeyBinding>) -> GroupedBindings {
-    let mut by_key: HashMap<GlobalKey, Vec<PressTarget>> = HashMap::new();
+    let mut by_key: HashMap<GlobalKey, BindingGroup> = HashMap::new();
     let mut rejected = Vec::new();
     for binding in bindings {
+        let label = binding.hotkey.display();
         match to_global_hotkeys(&binding.hotkey) {
             Ok(keys) => {
                 for key in keys {
-                    by_key.entry(key).or_default().push(PressTarget {
+                    let group = by_key.entry(key).or_insert_with(|| BindingGroup {
+                        labels: Vec::new(),
+                        targets: Vec::new(),
+                    });
+                    if !group.labels.contains(&label) {
+                        group.labels.push(label.clone());
+                    }
+                    group.targets.push(PressTarget {
                         id: binding.id,
                         path: binding.path.clone(),
                         action: binding.action,
@@ -373,7 +440,7 @@ fn group_bindings(bindings: Vec<HotkeyBinding>) -> GroupedBindings {
                     });
                 }
             }
-            Err(reason) => rejected.push((binding.hotkey.display(), reason)),
+            Err(reason) => rejected.push((label, reason)),
         }
     }
     (by_key, rejected)
@@ -383,11 +450,13 @@ fn dispatch_press(
     routing: &HashMap<u32, Vec<PressTarget>>,
     id: u32,
     audio_tx: &Sender<AudioCommand>,
-) -> usize {
+    event_tx: &Sender<HotkeyEvent>,
+) -> (usize, bool) {
     let Some(targets) = routing.get(&id) else {
-        return 0;
+        return (0, false);
     };
     let mut sent = 0;
+    let mut lost = false;
     for target in targets {
         let cmd = match target.action {
             BindingAction::Play => match &target.path {
@@ -396,7 +465,6 @@ fn dispatch_press(
                     path: path.clone(),
                     trim: target.trim,
                 },
-
                 None => {
                     warn!("Hotkey target {:?} has no file; skipping.", target.id);
                     continue;
@@ -404,40 +472,15 @@ fn dispatch_press(
             },
             BindingAction::StopAll => AudioCommand::StopAll,
         };
-        if audio_tx.send(cmd).is_ok() {
-            sent += 1;
+        match audio_tx.send(cmd) {
+            Ok(()) => sent += 1,
+            Err(err) => {
+                lost = true;
+                let _ = event_tx.send(HotkeyEvent::AudioUnavailable(err.into_inner()));
+            }
         }
     }
-    sent
-}
-
-fn key_to_display(key: &GlobalKey) -> String {
-    let mut parts = Vec::new();
-    if key.mods.contains(Modifiers::CONTROL) {
-        parts.push("Ctrl".to_string());
-    }
-    if key.mods.contains(Modifiers::ALT) {
-        parts.push("Alt".to_string());
-    }
-    if key.mods.contains(Modifiers::SHIFT) {
-        parts.push("Shift".to_string());
-    }
-    if key.mods.contains(Modifiers::SUPER) {
-        parts.push("Win".to_string());
-    }
-    parts.push(code_label(&key.key));
-    parts.join("+")
-}
-
-fn code_label(code: &Code) -> String {
-    match code {
-        Code::Space => "Space".to_owned(),
-        Code::ArrowDown => "Down".to_owned(),
-        Code::ArrowLeft => "Left".to_owned(),
-        Code::ArrowRight => "Right".to_owned(),
-        Code::ArrowUp => "Up".to_owned(),
-        _ => format!("{code:?}"),
-    }
+    (sent, lost)
 }
 
 #[cfg(test)]
@@ -446,11 +489,11 @@ mod tests {
     use crate::model::Hotkey;
 
     #[test]
-    fn rejected_grab_names_the_actual_key() {
-        assert_eq!(code_label(&Code::KeyQ), "KeyQ");
-        assert_eq!(code_label(&Code::F6), "F6");
-        assert_eq!(code_label(&Code::Numpad7), "Numpad7");
-        assert_ne!(code_label(&Code::F6), "key");
+    fn grouping_carries_the_user_facing_label() {
+        let (groups, rejected) = group_bindings(vec![binding(1, "Q", "/a.mp3")]);
+        assert!(rejected.is_empty());
+        let group = groups.values().next().expect("one grab");
+        assert_eq!(group.labels, vec!["Q".to_string()]);
     }
 
     #[test]
@@ -614,9 +657,9 @@ mod tests {
         let (groups, rejected) = group_bindings(bindings);
         assert!(rejected.is_empty());
         assert_eq!(groups.len(), 2);
-        for targets in groups.values() {
-            assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].id, 1);
+        for group in groups.values() {
+            assert_eq!(group.targets.len(), 1);
+            assert_eq!(group.targets[0].id, 1);
         }
     }
 
@@ -644,10 +687,11 @@ mod tests {
 
         assert_eq!(groups.len(), 2);
         let shared = to_global_hotkeys(&simple("F6")).unwrap()[0];
-        let targets = &groups[&shared];
-        assert_eq!(targets.len(), 2);
-        assert!(targets.iter().any(|t| t.id == 1));
-        assert!(targets.iter().any(|t| t.id == 2));
+        let group = &groups[&shared];
+        assert_eq!(group.labels, vec!["F6".to_string()]);
+        assert_eq!(group.targets.len(), 2);
+        assert!(group.targets.iter().any(|t| t.id == 1));
+        assert!(group.targets.iter().any(|t| t.id == 2));
     }
 
     #[test]
@@ -682,8 +726,10 @@ mod tests {
         );
 
         let (audio_tx, audio_rx) = crossbeam_channel::unbounded();
-        let sent = dispatch_press(&routing, key.id(), &audio_tx);
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let (sent, lost) = dispatch_press(&routing, key.id(), &audio_tx, &event_tx);
         assert_eq!(sent, 2);
+        assert!(!lost);
 
         let mut got = Vec::new();
         while let Ok(AudioCommand::Play {
@@ -716,7 +762,11 @@ mod tests {
         );
 
         let (audio_tx, audio_rx) = crossbeam_channel::unbounded();
-        assert_eq!(dispatch_press(&routing, key.id(), &audio_tx), 1);
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        assert_eq!(
+            dispatch_press(&routing, key.id(), &audio_tx, &event_tx),
+            (1, false)
+        );
         assert!(matches!(audio_rx.try_recv(), Ok(AudioCommand::StopAll)));
     }
 
@@ -730,17 +780,48 @@ mod tests {
         assert!(rejected.is_empty());
         assert_eq!(groups.len(), 2);
         let stop_key = to_global_hotkeys(&simple("F12")).unwrap()[0];
-        let targets = &groups[&stop_key];
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].id, STOP_ALL_ID);
-        assert_eq!(targets[0].action, BindingAction::StopAll);
+        let group = &groups[&stop_key];
+        assert_eq!(group.targets.len(), 1);
+        assert_eq!(group.targets[0].id, STOP_ALL_ID);
+        assert_eq!(group.targets[0].action, BindingAction::StopAll);
     }
 
     #[test]
     fn dispatch_ignores_unknown_ids() {
         let routing: HashMap<u32, Vec<PressTarget>> = HashMap::new();
         let (audio_tx, audio_rx) = crossbeam_channel::unbounded();
-        assert_eq!(dispatch_press(&routing, 12345, &audio_tx), 0);
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        assert_eq!(
+            dispatch_press(&routing, 12345, &audio_tx, &event_tx),
+            (0, false)
+        );
         assert!(audio_rx.try_recv().is_err());
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dispatch_reports_a_dead_audio_engine() {
+        let key = to_global_hotkeys(&simple("F12")).unwrap()[0];
+        let mut routing: HashMap<u32, Vec<PressTarget>> = HashMap::new();
+        routing.insert(
+            key.id(),
+            vec![PressTarget {
+                id: STOP_ALL_ID,
+                path: None,
+                action: BindingAction::StopAll,
+                trim: None,
+            }],
+        );
+
+        let (audio_tx, audio_rx) = crossbeam_channel::unbounded::<AudioCommand>();
+        drop(audio_rx);
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (sent, lost) = dispatch_press(&routing, key.id(), &audio_tx, &event_tx);
+        assert_eq!(sent, 0);
+        assert!(lost);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(HotkeyEvent::AudioUnavailable(AudioCommand::StopAll))
+        ));
     }
 }

@@ -6,6 +6,7 @@ mod config;
 mod devices;
 mod hotkey;
 mod icon_art;
+mod instance;
 mod model;
 mod paths;
 mod record;
@@ -15,6 +16,20 @@ mod waveform;
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Held for the whole run; the lock is released by the OS on exit.
+    let _instance = match instance::acquire() {
+        Ok(lock) => lock,
+        Err(message) => {
+            log::error!("{message}");
+            let _ = rfd::MessageDialog::new()
+                .set_title("Open Soundboard")
+                .set_description(message)
+                .set_level(rfd::MessageLevel::Warning)
+                .show();
+            return Ok(());
+        }
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

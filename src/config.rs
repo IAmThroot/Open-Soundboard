@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crossbeam_channel::{Receiver, Sender};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +104,47 @@ pub fn save(state: &AppState) -> Result<(), String> {
     )
 }
 
+pub enum SaveCommand {
+    Save {
+        generation: u64,
+        state: AppState,
+        /// Set by the exit path so it can wait for the final write.
+        ack: Option<Sender<()>>,
+    },
+}
+
+pub type SaveResult = (u64, Result<(), String>);
+
+/// Serialises config writes on a background thread. The UI queues a snapshot
+/// and keeps rendering; `generation` lets it tell whether the write it just
+/// received is still current.
+pub fn spawn_saver(ctx: egui::Context) -> (Sender<SaveCommand>, Receiver<SaveResult>) {
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SaveCommand>();
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<SaveResult>();
+
+    std::thread::Builder::new()
+        .name("config-saver".to_owned())
+        .spawn(move || {
+            while let Ok(SaveCommand::Save {
+                generation,
+                state,
+                ack,
+            }) = cmd_rx.recv()
+            {
+                let result = save(&state);
+                let _ = res_tx.send((generation, result));
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+                ctx.request_repaint();
+            }
+            info!("Config saver shutting down.");
+        })
+        .expect("failed to spawn config saver thread");
+
+    (cmd_tx, res_rx)
+}
+
 #[cfg(test)]
 fn load_from(path: &Path) -> Option<AppState> {
     match load_outcome_from(path) {
@@ -134,7 +176,10 @@ fn load_outcome_from(path: &Path) -> LoadOutcome {
         Some(b) => b,
         None => {
             let err = last_err.unwrap();
-            warn!("Could not read config {} after 3 attempts: {err}", path.display());
+            warn!(
+                "Could not read config {} after 3 attempts: {err}",
+                path.display()
+            );
             return LoadOutcome::ReadError(format!("Could not read config: {err}"));
         }
     };
@@ -252,7 +297,10 @@ fn backup(path: &Path, suffix: &str) {
             .unwrap_or(0);
         let extra = path.with_extension(format!("{suffix}.{ts}"));
         if let Err(err) = std::fs::copy(&backup_path, &extra) {
-            warn!("Could not archive previous backup {}: {err}", backup_path.display());
+            warn!(
+                "Could not archive previous backup {}: {err}",
+                backup_path.display()
+            );
         }
     }
     if let Err(err) = std::fs::rename(path, &backup_path) {
@@ -421,7 +469,11 @@ pub fn next_slot_id(boards: &[Board]) -> SlotId {
 }
 
 pub fn next_board_id(boards: &[Board]) -> crate::model::BoardId {
-    boards.iter().map(|b| b.id).max().map_or(1, |max| max.saturating_add(1))
+    boards
+        .iter()
+        .map(|b| b.id)
+        .max()
+        .map_or(1, |max| max.saturating_add(1))
 }
 
 #[cfg(test)]

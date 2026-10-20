@@ -10,8 +10,6 @@ use egui::{
 use log::debug;
 
 use crate::audio::{spawn_audio_engine, AudioCommand, AudioEvent, TrimSpec, TEST_SOUND_ID};
-
-const PREVIEW_TRIM_ID: SlotId = u64::MAX - 2;
 use crate::config::{self, AppState, STATE_VERSION};
 use crate::devices::{list_output_devices, SYSTEM_DEFAULT_LABEL};
 use crate::hotkey::{
@@ -22,6 +20,8 @@ use crate::record::{spawn_recorder, RecordCommand, RecordEvent};
 use crate::theme;
 use crate::tray::{Tray, TrayAction};
 use crate::waveform::{build_waveform, Waveform};
+
+const PREVIEW_TRIM_ID: SlotId = u64::MAX - 2;
 
 const SLOT_W: f32 = 200.0;
 const SLOT_H: f32 = 156.0;
@@ -94,6 +94,10 @@ pub struct SoundboardApp {
 
     mic_starting: Option<Instant>,
 
+    /// Board that was active when the user pressed Record; the finished take
+    /// is added there even if they switch boards while recording.
+    mic_start_board: Option<BoardId>,
+
     mic_devices: Vec<String>,
     mic_device: String,
 
@@ -105,6 +109,11 @@ pub struct SoundboardApp {
     save_error: Option<String>,
     read_only: bool,
 
+    save_tx: Sender<config::SaveCommand>,
+    save_rx: Receiver<config::SaveResult>,
+    save_in_flight: bool,
+    edit_generation: u64,
+
     ctx: egui::Context,
 
     broken: HashSet<SlotId>,
@@ -114,6 +123,10 @@ pub struct SoundboardApp {
     recording: Option<SlotId>,
 
     playing: HashSet<SlotId>,
+
+    /// The trim editor's preview uses `PREVIEW_TRIM_ID`; it is tracked
+    /// separately so Stop All can enable/disable correctly.
+    preview_playing: bool,
 
     testing: bool,
 
@@ -245,6 +258,7 @@ const MIC_START_TIMEOUT: Duration = Duration::from_secs(8);
 
 struct MicTake {
     started: Instant,
+    board: BoardId,
 }
 
 #[derive(Clone)]
@@ -312,10 +326,11 @@ impl SoundboardApp {
         let (audio_tx, audio_rx) =
             spawn_audio_engine(output_device.clone(), volume, cc.egui_ctx.clone());
 
-        let (hotkey_tx, hotkey_rx) =
-            spawn_hotkey_thread(audio_tx.clone(), cc.egui_ctx.clone());
+        let (hotkey_tx, hotkey_rx) = spawn_hotkey_thread(audio_tx.clone(), cc.egui_ctx.clone());
 
         let (record_tx, record_rx) = spawn_recorder(cc.egui_ctx.clone());
+
+        let (save_tx, save_rx) = config::spawn_saver(cc.egui_ctx.clone());
 
         let next_slot_id = config::next_slot_id(&boards);
 
@@ -335,6 +350,7 @@ impl SoundboardApp {
             record_rx,
             mic: None,
             mic_starting: None,
+            mic_start_board: None,
             mic_devices,
             mic_device,
             stop_hotkey,
@@ -343,10 +359,15 @@ impl SoundboardApp {
             save_backoff: Duration::from_millis(700),
             save_error,
             read_only,
+            save_tx,
+            save_rx,
+            save_in_flight: false,
+            edit_generation: 0,
             broken: HashSet::new(),
             next_slot_id,
             recording: None,
             playing: HashSet::new(),
+            preview_playing: false,
             testing: false,
             confirm: None,
             toast: None,
@@ -418,6 +439,8 @@ impl SoundboardApp {
                     "Hotkey recording cancelled — window hidden to tray.",
                 );
             }
+
+            self.stop_preview();
 
             if self.config_dirty {
                 self.save_now();
@@ -579,7 +602,18 @@ impl SoundboardApp {
         if !self.boards.iter().any(|b| b.id == id) {
             return;
         }
+        if self.recording.take().is_some() {
+            self.toast(
+                ToastKind::Info,
+                "Hotkey recording cancelled — you switched boards.",
+            );
+        }
+        // A pending hotkey confirmation targets a slot on the old board; letting
+        // it survive the switch would apply the key to a board that is no longer
+        // bound.
+        self.confirm = None;
         self.playing.clear();
+        self.preview_playing = false;
         self.testing = false;
         self.send(AudioCommand::StopAll);
         self.active_board = id;
@@ -609,19 +643,49 @@ impl SoundboardApp {
         let Some(pos) = self.boards.iter().position(|b| b.id == id) else {
             return;
         };
+        let deleting_active = id == self.active_board;
         let removed: Board = self.boards.remove(pos);
+        let capture_removed = self
+            .recording
+            .is_some_and(|rid| removed.slots.iter().any(|s| s.id == rid));
+        let editor_removed = self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| removed.slots.iter().any(|s| s.id == editor.slot));
         for slot in &removed.slots {
             self.broken.remove(&slot.id);
             self.waves.invalidate(slot.id);
+            if self.playing.remove(&slot.id) {
+                self.send(AudioCommand::Stop(slot.id));
+            }
         }
         self.board_dialog = None;
+        // Any pending hotkey confirmation may refer to a slot on the board that
+        // is being removed; never apply it after the board is gone.
+        self.confirm = None;
+
+        if editor_removed {
+            self.stop_preview();
+            self.editor = None;
+        }
+        if capture_removed {
+            self.recording = None;
+            self.toast(
+                ToastKind::Info,
+                "Hotkey recording cancelled — its board was deleted.",
+            );
+        }
 
         let landing = self
             .boards
             .get(pos.min(self.boards.len().saturating_sub(1)))
             .map(|b| b.id)
             .expect("at least one board remains");
-        self.switch_board(landing);
+        if deleting_active {
+            self.switch_board(landing);
+        } else if capture_removed {
+            self.push_hotkey_rebuild();
+        }
         self.mark_dirty();
         self.toast(ToastKind::Info, format!("Deleted “{}”.", removed.name));
     }
@@ -878,7 +942,7 @@ impl SoundboardApp {
                         self.add_sound_via_picker();
                     }
 
-                    let any_playing = !self.playing.is_empty() || self.testing;
+                    let any_playing = !self.playing.is_empty() || self.testing || self.preview_playing;
                     if ui
                         .add_enabled(any_playing, Button::new(RichText::new("⏹  Stop All")))
                         .on_hover_text("Stop every sound right now")
@@ -886,6 +950,7 @@ impl SoundboardApp {
                     {
                         self.playing.clear();
                         self.testing = false;
+                        self.preview_playing = false;
                         self.send(AudioCommand::StopAll);
                     }
 
@@ -1033,6 +1098,7 @@ impl SoundboardApp {
                             let device = (self.mic_device != SYSTEM_DEFAULT_LABEL)
                                 .then(|| self.mic_device.clone());
                             self.mic_starting = Some(Instant::now());
+                            self.mic_start_board = Some(self.active_board);
                             let _ = self.record_tx.send(RecordCommand::Start(device));
                         }
                     }
@@ -1479,17 +1545,28 @@ impl SoundboardApp {
     }
 
     fn send(&mut self, cmd: AudioCommand) {
+        let mut cmd = cmd;
         if let Err(err) = self.audio_tx.send(cmd) {
             log::error!("Audio engine send failed ({err}); restarting engine.");
-            let (tx, rx) = spawn_audio_engine(
-                self.output_device.clone(),
-                self.volume,
-                self.ctx.clone(),
-            );
+            cmd = err.into_inner();
+            let (tx, rx) =
+                spawn_audio_engine(self.output_device.clone(), self.volume, self.ctx.clone());
             self.audio_tx = tx;
             self.audio_rx = rx;
             self.playing.clear();
+            self.preview_playing = false;
             self.testing = false;
+            // Retry the command that discovered the dead engine, otherwise
+            // the first click/hotkey after a crash would be silently lost.
+            if let Err(err) = self.audio_tx.send(cmd) {
+                log::error!("Audio engine restart failed to accept the command: {err}");
+            }
+            if let Err(err) = self
+                .hotkey_tx
+                .send(HotkeyCommand::SetAudio(self.audio_tx.clone()))
+            {
+                log::warn!("Could not give the hotkey listener the new audio sender: {err}");
+            }
             self.toast(
                 ToastKind::Warn,
                 "The audio engine stopped unexpectedly and was restarted.",
@@ -1503,7 +1580,9 @@ impl SoundboardApp {
                 AudioEvent::Started(id) => {
                     if id == TEST_SOUND_ID {
                         self.testing = true;
-                    } else if id != PREVIEW_TRIM_ID {
+                    } else if id == PREVIEW_TRIM_ID {
+                        self.preview_playing = true;
+                    } else {
                         self.playing.insert(id);
                         if self.broken.remove(&id) {
                             self.push_hotkey_rebuild();
@@ -1513,28 +1592,40 @@ impl SoundboardApp {
                 AudioEvent::Finished(id) => {
                     if id == TEST_SOUND_ID {
                         self.testing = false;
-                    } else if id != PREVIEW_TRIM_ID {
+                    } else if id == PREVIEW_TRIM_ID {
+                        self.preview_playing = false;
+                    } else {
                         self.playing.remove(&id);
                     }
                 }
                 AudioEvent::FileMissing { id, path } => {
-                    self.playing.remove(&id);
-                    if let Some(slot) = self.find_slot_mut(id) {
-                        slot.missing = true;
-                    }
+                    if id == PREVIEW_TRIM_ID {
+                        self.preview_playing = false;
+                        self.toast(
+                            ToastKind::Warn,
+                            format!("Can't find {} — did you move or delete it?", path.display()),
+                        );
+                    } else {
+                        self.playing.remove(&id);
+                        if let Some(slot) = self.find_slot_mut(id) {
+                            slot.missing = true;
+                        }
 
-                    self.push_hotkey_rebuild();
-                    self.toast(
-                        ToastKind::Warn,
-                        format!(
-                            "Can't find {} — did you move or delete it? Use Find Again to re-link it.",
-                            path.display()
-                        ),
-                    );
+                        self.push_hotkey_rebuild();
+                        self.toast(
+                            ToastKind::Warn,
+                            format!(
+                                "Can't find {} — did you move or delete it? Use Find Again to re-link it.",
+                                path.display()
+                            ),
+                        );
+                    }
                 }
                 AudioEvent::DecodeError { id, message } => {
-                    if id == TEST_SOUND_ID || id == PREVIEW_TRIM_ID {
+                    if id == TEST_SOUND_ID {
                         self.testing = false;
+                    } else if id == PREVIEW_TRIM_ID {
+                        self.preview_playing = false;
                     } else {
                         self.playing.remove(&id);
                         self.broken.insert(id);
@@ -1542,24 +1633,20 @@ impl SoundboardApp {
                     }
                     self.toast(ToastKind::Warn, message);
                 }
-                AudioEvent::DeviceReady {
-                    requested,
-                    actual,
-                    fallback,
-                } => {
+                AudioEvent::DeviceReady { actual, fallback } => {
                     if let Some(note) = fallback {
                         if !actual.is_empty() {
                             self.output_device = actual;
                         }
                         self.playing.clear();
+                        self.preview_playing = false;
                         self.testing = false;
                         self.toast(ToastKind::Warn, note);
-                    } else if requested != SYSTEM_DEFAULT_LABEL && requested != self.output_device {
-                        self.output_device = requested;
                     }
                 }
                 AudioEvent::StreamError(message) => {
                     self.playing.clear();
+                    self.preview_playing = false;
                     self.testing = false;
                     self.toast(ToastKind::Warn, message);
                 }
@@ -1588,12 +1675,17 @@ impl SoundboardApp {
                         );
                     }
                 }
+                HotkeyEvent::AudioUnavailable(cmd) => {
+                    log::warn!("Hotkey press found a dead audio engine; restarting and retrying.");
+                    self.send(cmd);
+                }
             }
         }
         changed
     }
 
     fn mark_dirty(&mut self) {
+        self.edit_generation = self.edit_generation.wrapping_add(1);
         self.config_dirty = true;
         self.ctx.request_repaint();
         self.ctx.request_repaint_after(Duration::from_millis(700));
@@ -1618,12 +1710,38 @@ impl SoundboardApp {
             log::warn!("Config save skipped: application is in read-only mode.");
             return;
         }
-        match config::save(&self.snapshot_state()) {
+        if self.save_in_flight {
+            // A write is already running; the newer generation stays dirty and
+            // the autosave timer picks it up when the current one finishes.
+            return;
+        }
+
+        let generation = self.edit_generation;
+        let command = config::SaveCommand::Save {
+            generation,
+            state: self.snapshot_state(),
+            ack: None,
+        };
+        match self.save_tx.send(command) {
+            Ok(()) => self.save_in_flight = true,
+            Err(_) => {
+                log::error!("Config saver thread is gone; saving inline.");
+                let result = config::save(&self.snapshot_state());
+                self.apply_save_result(generation, result);
+            }
+        }
+    }
+
+    fn apply_save_result(&mut self, generation: u64, result: Result<(), String>) {
+        self.save_in_flight = false;
+        match result {
             Ok(()) => {
                 log::info!("Saved state ({} boards).", self.boards.len());
-                self.config_dirty = false;
                 self.last_save = Instant::now();
                 self.save_backoff = Duration::from_millis(700);
+                if generation == self.edit_generation {
+                    self.config_dirty = false;
+                }
                 if self.save_error.is_some() {
                     self.save_error = None;
                     self.toast(ToastKind::Good, "Soundboard layout saved successfully.");
@@ -1644,10 +1762,24 @@ impl SoundboardApp {
                 self.ctx.request_repaint_after(self.save_backoff);
             }
         }
+        self.ctx.request_repaint();
+    }
+
+    fn poll_save_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((generation, result)) = self.save_rx.try_recv() {
+            changed = true;
+            self.apply_save_result(generation, result);
+        }
+        changed
     }
 
     fn maybe_autosave(&mut self) {
-        if self.config_dirty && !self.read_only && self.last_save.elapsed() >= self.save_backoff {
+        if self.config_dirty
+            && !self.read_only
+            && !self.save_in_flight
+            && self.last_save.elapsed() >= self.save_backoff
+        {
             self.save_now();
         }
     }
@@ -1660,8 +1792,10 @@ impl SoundboardApp {
             self.mic_starting = None;
             match event {
                 RecordEvent::Started { device } => {
+                    let board = self.mic_start_board.take().unwrap_or(self.active_board);
                     self.mic = Some(MicTake {
                         started: Instant::now(),
+                        board,
                     });
 
                     self.toast(ToastKind::Info, format!("Recording from {device}."));
@@ -1669,32 +1803,71 @@ impl SoundboardApp {
                 RecordEvent::Saved {
                     path,
                     duration_secs,
-                    cut_short,
+                    capped,
+                    dropped_chunks,
+                    stream_died,
                 } => {
+                    let target_board = self
+                        .mic
+                        .as_ref()
+                        .map(|take| take.board)
+                        .unwrap_or(self.active_board);
                     self.mic = None;
+                    self.mic_start_board = None;
+
                     let name = Self::display_name_for(&path);
                     let id = self.alloc_id();
                     let mut slot = SoundSlot::with_file(id, name.clone(), path);
                     slot.duration_secs = Some(duration_secs);
-                    self.active_mut().slots.push(slot);
+
+                    let board_name = match self.boards.iter().find(|b| b.id == target_board) {
+                        Some(board) => board.name.clone(),
+                        None => self.active().name.clone(),
+                    };
+                    if let Some(board) = self.boards.iter_mut().find(|b| b.id == target_board) {
+                        board.slots.push(slot);
+                    } else {
+                        // The original board was deleted while recording; keep
+                        // the take rather than throwing it away.
+                        self.active_mut().slots.push(slot);
+                    }
                     self.mark_dirty();
-                    if cut_short {
+
+                    let seconds = format!("{duration_secs:.1}s");
+                    if capped {
                         self.toast(
                             ToastKind::Warn,
                             format!(
-                                "The microphone stopped early — kept {duration_secs:.1}s as \
-                                 “{name}”."
+                                "Reached the 10-minute limit — saved {seconds} as “{name}” on \
+                                 “{board_name}”."
+                            ),
+                        );
+                    } else if stream_died {
+                        self.toast(
+                            ToastKind::Warn,
+                            format!(
+                                "The microphone stopped early — kept {seconds} as “{name}” on \
+                                 “{board_name}”."
+                            ),
+                        );
+                    } else if dropped_chunks > 0 {
+                        self.toast(
+                            ToastKind::Warn,
+                            format!(
+                                "Saved “{name}” ({seconds}) on “{board_name}”, but {dropped_chunks} \
+                                 audio chunk(s) were dropped — it may have gaps."
                             ),
                         );
                     } else {
                         self.toast(
                             ToastKind::Good,
-                            format!("Saved “{name}” ({duration_secs:.1}s) to this board."),
+                            format!("Saved “{name}” ({seconds}) to “{board_name}”."),
                         );
                     }
                 }
                 RecordEvent::Failed(message) => {
                     self.mic = None;
+                    self.mic_start_board = None;
                     self.toast(ToastKind::Warn, message);
                 }
             }
@@ -1708,6 +1881,7 @@ impl SoundboardApp {
                 self.add_sound_via_picker();
             }
             SlotAction::Play(id) => {
+                self.stop_preview();
                 let found = self.active().slots.iter().find(|s| s.id == id).cloned();
                 if let Some(slot) = found {
                     if let Some(path) = slot.file_path.clone() {
@@ -1747,6 +1921,10 @@ impl SoundboardApp {
                 self.toast(ToastKind::Info, "Hotkey removed.");
             }
             SlotAction::Remove(id) => {
+                if self.editor.as_ref().is_some_and(|editor| editor.slot == id) {
+                    self.stop_preview();
+                    self.editor = None;
+                }
                 self.active_mut().slots.retain(|s| s.id != id);
                 self.playing.remove(&id);
                 self.broken.remove(&id);
@@ -1777,6 +1955,7 @@ impl SoundboardApp {
             .map(|s| (s.file_path.clone(), s.missing, s.trim_start, s.trim_end));
         match found {
             Some((Some(path), false, start, end)) => {
+                self.stop_preview();
                 self.waves.request(id, path);
                 self.editor = Some(EditorState {
                     slot: id,
@@ -1826,6 +2005,7 @@ impl SoundboardApp {
             .find(|s| s.id == slot_id)
             .cloned();
         let Some(slot) = slot else {
+            self.stop_preview();
             self.editor = None;
             return;
         };
@@ -1940,7 +2120,12 @@ impl SoundboardApp {
                         });
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("▶  Play").clicked() {
+                            let preview_label = if self.preview_playing {
+                                "⏹  Stop"
+                            } else {
+                                "▶  Play"
+                            };
+                            if ui.button(preview_label).clicked() {
                                 preview = true;
                             }
                             if ui.button("Reset").clicked() {
@@ -1966,19 +2151,26 @@ impl SoundboardApp {
             });
 
         if close {
+            self.stop_preview();
             self.editor = None;
         }
         if reset {
+            self.stop_preview();
             if let Some(editor) = self.editor.as_mut() {
                 editor.start_frac = 0.0;
                 editor.end_frac = 1.0;
             }
         }
         if preview {
-            let editor = self.editor.as_ref().expect("editor open");
-            self.preview_trim(slot_id, editor.start_frac, editor.end_frac);
+            if self.preview_playing {
+                self.stop_preview();
+            } else {
+                let editor = self.editor.as_ref().expect("editor open");
+                self.preview_trim(slot_id, editor.start_frac, editor.end_frac);
+            }
         }
         if let Some((start, end, duration)) = save {
+            self.stop_preview();
             if let Some(slot) = self.find_slot_mut(slot_id) {
                 slot.trim_start = start;
                 slot.trim_end = end;
@@ -1988,6 +2180,14 @@ impl SoundboardApp {
             self.push_hotkey_rebuild();
             self.mark_dirty();
             self.toast(ToastKind::Good, "Trim saved.");
+        }
+    }
+
+    /// Stops the trim-editor preview without touching normal playback.
+    fn stop_preview(&mut self) {
+        if self.preview_playing {
+            self.send(AudioCommand::Stop(PREVIEW_TRIM_ID));
+            self.preview_playing = false;
         }
     }
 
@@ -2018,6 +2218,9 @@ impl SoundboardApp {
                     duration_secs,
                 }),
             });
+            // Track the request immediately so closing the editor during the
+            // hand-off still sends the matching Stop.
+            self.preview_playing = true;
         }
     }
 
@@ -2040,15 +2243,27 @@ impl SoundboardApp {
         let Some(path) = Self::pick_sound_file() else {
             return;
         };
+        self.stop_preview();
         let name = Self::display_name_for(&path);
+        let editor_open_for_slot = self.editor.as_ref().is_some_and(|e| e.slot == id);
         if let Some(slot) = self.find_slot_mut(id) {
             slot.name = name.clone();
-            slot.file_path = Some(path);
+            slot.file_path = Some(path.clone());
             slot.missing = false;
 
             slot.clear_trim();
         }
+        self.playing.remove(&id);
+        self.send(AudioCommand::Stop(id));
         self.waves.invalidate(id);
+        if editor_open_for_slot {
+            if let Some(editor) = self.editor.as_mut() {
+                editor.start_frac = 0.0;
+                editor.end_frac = 1.0;
+                editor.drag = None;
+            }
+            self.waves.request(id, path);
+        }
 
         self.broken.remove(&id);
         self.push_hotkey_rebuild();
@@ -2096,7 +2311,7 @@ impl SoundboardApp {
             ctx.request_repaint_after(remaining);
         }
 
-        if self.config_dirty && !self.read_only {
+        if self.config_dirty && !self.read_only && !self.save_in_flight {
             let elapsed = self.last_save.elapsed();
             if elapsed < self.save_backoff {
                 ctx.request_repaint_after(self.save_backoff - elapsed);
@@ -2144,6 +2359,7 @@ impl eframe::App for SoundboardApp {
                 self.record_tx = tx;
                 self.record_rx = rx;
                 self.mic_starting = None;
+                self.mic_start_board = None;
                 self.toast(
                     ToastKind::Warn,
                     "The microphone took too long to open — it may be in use by another app. \
@@ -2159,13 +2375,43 @@ impl eframe::App for SoundboardApp {
             self.handle_recording(ctx);
         }
 
+        if self.poll_save_results() {
+            ctx.request_repaint();
+        }
         self.schedule_repaint(ctx);
         self.maybe_autosave();
     }
 
     fn on_exit(&mut self) {
-        if self.config_dirty {
-            self.save_now();
+        if self.read_only {
+            return;
+        }
+
+        // Let any write that is already running finish, then queue a final
+        // snapshot containing the newest edits and wait for it to land.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.save_in_flight && Instant::now() < deadline {
+            if let Ok((generation, result)) = self.save_rx.recv_timeout(Duration::from_millis(50)) {
+                self.apply_save_result(generation, result);
+            }
+        }
+
+        if !self.config_dirty {
+            return;
+        }
+
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let command = config::SaveCommand::Save {
+            generation: self.edit_generation,
+            state: self.snapshot_state(),
+            ack: Some(ack_tx),
+        };
+        if self.save_tx.send(command).is_ok() {
+            if ack_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                log::warn!("Timed out waiting for the final config save.");
+            }
+        } else if let Err(err) = config::save(&self.snapshot_state()) {
+            log::warn!("Could not save config on exit: {err}");
         }
     }
 }
@@ -2195,27 +2441,18 @@ fn draw_waveform(
     let half_h = rect.height() / 2.0 - 8.0;
     let x_of = |frac: f32| rect.left() + frac.clamp(0.0, 1.0) * rect.width();
 
-    let mut kept: Vec<[egui::Pos2; 2]> = Vec::new();
-    let mut cut: Vec<[egui::Pos2; 2]> = Vec::new();
     for (i, (min, max)) in wave.peaks.iter().enumerate() {
         let frac = (i as f32 + 0.5) / wave.peaks.len() as f32;
         let x = x_of(frac);
         let y_top = mid_y - max.clamp(-1.0, 1.0) * half_h;
         let y_bot = mid_y - min.clamp(-1.0, 1.0) * half_h;
         let segment = [egui::pos2(x, y_top), egui::pos2(x, y_bot.max(y_top + 1.0))];
-        if frac >= start_frac && frac <= end_frac {
-            kept.push(segment);
+        let colour = if frac >= start_frac && frac <= end_frac {
+            theme::TEXT
         } else {
-            cut.push(segment);
-        }
-    }
-    for segment in cut {
-        ui.painter()
-            .line_segment(segment, Stroke::new(1.0, theme::MUTED));
-    }
-    for segment in kept {
-        ui.painter()
-            .line_segment(segment, Stroke::new(1.0, theme::TEXT));
+            theme::MUTED
+        };
+        ui.painter().line_segment(segment, Stroke::new(1.0, colour));
     }
 
     for frac in [start_frac, end_frac] {

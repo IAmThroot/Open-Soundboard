@@ -53,7 +53,6 @@ pub enum AudioEvent {
     },
 
     DeviceReady {
-        requested: String,
         actual: String,
         fallback: Option<String>,
     },
@@ -159,7 +158,6 @@ impl Engine {
                 self.mixer = Some(mixer);
                 self.current_device = requested.to_owned();
                 self.emit(AudioEvent::DeviceReady {
-                    requested: requested.to_owned(),
                     actual: opened.actual_name,
                     fallback: opened.fallback_note,
                 });
@@ -169,7 +167,6 @@ impl Engine {
                 self.sink = None;
                 self.mixer = None;
                 self.emit(AudioEvent::DeviceReady {
-                    requested: requested.to_owned(),
                     actual: String::new(),
                     fallback: Some(message),
                 });

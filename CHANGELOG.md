@@ -1,5 +1,24 @@
 # Changelog
 
+## [v0.1.2] — 2026-10-20
+
+### Bug fixes
+- **Hotkeys:** after the audio engine restarted, presses still reached the dead engine and were silently lost. The listener now receives the new audio sender whenever the engine restarts, and a press that still lands on a dead engine is reported back to the UI, which restarts the engine and retries it (instead of dropping the action).
+- **Hotkeys:** rejected-grab warnings and ⚠ badges now use the same label as the binding (`Q`, `7`, `Down`) instead of the OS code name (`KeyQ`, `Digit7`, `ArrowDown`), so the badge appears for letters, digits, and arrows. Partially registered twin keys (top-row + numpad) no longer show a false rejection when the other twin works.
+- **Trim preview:** preview playback is now tracked, so its Play button toggles to Stop, the editor stops it on close/save/reset, and Stop All is enabled while it plays.
+- **Recording:** the 10-minute cap, a microphone failure, and dropped audio chunks are now reported as distinct outcomes instead of "the microphone stopped early". Disk write errors abort the take and delete the partial file instead of silently truncating it.
+- **Recording:** a take is added to the board that was active when recording started, even if you switch boards while recording.
+- **Boards:** switching or deleting a board cancels an in-progress hotkey capture instead of writing the key to a hidden board. Deleting a board that isn't open no longer jumps you to a different board, and any of its sounds that are still playing are stopped.
+- **Persistence:** config writes (including `fsync`) no longer block the UI thread; a background saver serialises snapshots and the exit path flushes the newest state.
+- **Startup:** a second instance now exits with a message instead of both copies racing on `config.json`.
+- **Waveforms:** proportional bucket mapping removes the flat, repeated tail that short clips displayed.
+- **Build:** Windows version metadata is generated from `Cargo.toml`, removing the duplicated `0.1.1` constants.
+- **Formatting:** ran `cargo fmt` so the CI check passes.
+
+### Polish
+- Re-linking a sound stops its old playback, resets the trim selection, and refreshes an open trim editor's waveform.
+- README no longer claims literal `0% CPU` and documents the 10-minute take cap and single-instance behaviour.
+
 ## [v0.1.1] — 2026-10-18
 
 ### Bug fixes
@@ -20,4 +39,5 @@
 - **README:** fixed inaccurate claims about per-board volume sliders and an `Esc`-default stop key; updated download links for v0.1.1.
 - **Tests:** added unit tests for `app.rs` helpers (`fmt_time`, `ellipsize`, `shorten_device`, `trim_spec_for`), model `looks_like_typing`, and config stop-key clash handling on any board.
 
+[v0.1.2]: https://github.com/IAmThroot/Open-Soundboard/releases/tag/v0.1.2
 [v0.1.1]: https://github.com/IAmThroot/Open-Soundboard/releases/tag/v0.1.1

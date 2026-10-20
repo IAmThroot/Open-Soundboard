@@ -25,7 +25,7 @@ Designed for gamers, streamers, podcasters, and everyday users who want a soundb
 - **💾 Automatic Atomic Persistence**  
   No manual save buttons. Your boards, sound configurations, volume levels, and hotkey bindings are saved atomically to `%APPDATA%\OpenSoundboard\Open Soundboard\config\config.json`, preventing config corruption even during unexpected shutdowns.
 - **⚡ Ultra-Lightweight & Native**  
-  Written 100% in Rust using `eframe`/`egui`, `rodio`, and `cpal`. Consumes 0% CPU at idle and starts instantly.
+  Written 100% in Rust using `eframe`/`egui`, `rodio`, and `cpal`. Uses almost no CPU at idle and starts instantly.
 
 ---
 
@@ -35,7 +35,7 @@ Open Soundboard runs on **64-bit Windows 10 and Windows 11**.
 
 ### Option 1: Windows Installer (Recommended)
 
-1. Download **`OpenSoundboard-Setup-0.1.1.exe`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
+1. Download **`OpenSoundboard-Setup-0.1.2.exe`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
 2. Run the installer.
    - **No Administrator Rights Required:** Open Soundboard installs cleanly per-user into `%LOCALAPPDATA%\Programs\Open Soundboard`.
    - Optionally check the box to create a Desktop shortcut.
@@ -45,7 +45,7 @@ Open Soundboard runs on **64-bit Windows 10 and Windows 11**.
 
 ### Option 2: Portable Zip
 
-1. Download **`OpenSoundboard-0.1.1-portable.zip`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
+1. Download **`OpenSoundboard-0.1.2-portable.zip`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
 2. Extract the folder anywhere on your computer (e.g., `Documents` or a USB flash drive).
 3. Double-click `open-soundboard.exe` to run. No files are written to `Program Files` or the Windows Registry.
 
@@ -73,7 +73,7 @@ cargo run --release
 To compile the Windows installer locally, install [Inno Setup 6](https://jrsoftware.org/isdl.php) and run:
 ```powershell
 cargo build --release
-iscc /DMyAppVersion=0.1.1 packaging\installer.iss
+iscc /DMyAppVersion=0.1.2 packaging\installer.iss
 ```
 
 ---
@@ -109,7 +109,8 @@ To play sounds into voice chat so your friends or teammates can hear them:
 - In the top toolbar, select your physical microphone from the input picker.
 - Click **Record**. Speak or play the sound you wish to capture.
 - Click **Stop Recording**.
-- The recording is streamed directly to `%APPDATA%\OpenSoundboard\Open Soundboard\data\recordings\`, and a new tile is added to your board ready for hotkey assignment.
+- The recording is streamed directly to `%APPDATA%\OpenSoundboard\Open Soundboard\data\recordings\`, and a new tile is added to your board ready for hotkey assignment. A single take is capped at 10 minutes.
+- Only one copy of Open Soundboard runs at a time, so two windows can't overwrite the same layout.
 
 ### 6. System Tray & Background Operation
 - Click the **⚙ (Settings)** button in the toolbar.

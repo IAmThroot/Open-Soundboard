@@ -97,19 +97,21 @@ pub fn build_waveform(path: &Path) -> Result<Waveform, String> {
 }
 
 fn reduce_chunk_peaks(chunks: &[(f32, f32)], buckets: usize) -> Vec<(f32, f32)> {
+    assert!(buckets > 0);
     if chunks.is_empty() {
         return vec![(0.0, 0.0); buckets];
     }
-    let per_bucket = (chunks.len() as f32 / buckets as f32).max(1.0);
+    let total = chunks.len();
     (0..buckets)
         .map(|b| {
-            let start = (b as f32 * per_bucket) as usize;
-            let end = (((b + 1) as f32 * per_bucket) as usize)
-                .max(start + 1)
-                .min(chunks.len());
-            let slice = &chunks[start.min(chunks.len() - 1)..end];
+            // Map buckets proportionally across the whole clip. Using
+            // `.max(1.0)` here would stop advancing once the bucket count
+            // exceeded the chunk count and repeat the final chunk for the
+            // rest of the width (short clips looked like flat blocks).
+            let start = b * total / buckets;
+            let end = (((b + 1) * total / buckets).max(start + 1)).min(total);
             let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
-            for &(c_min, c_max) in slice {
+            for &(c_min, c_max) in &chunks[start..end] {
                 min = min.min(c_min);
                 max = max.max(c_max);
             }
@@ -127,16 +129,13 @@ fn reduce_peaks(mono: &[f32], buckets: usize) -> Vec<(f32, f32)> {
     if mono.is_empty() {
         return vec![(0.0, 0.0); buckets];
     }
-    let per_bucket = (mono.len() as f32 / buckets as f32).max(1.0);
+    let total = mono.len();
     (0..buckets)
         .map(|b| {
-            let start = (b as f32 * per_bucket) as usize;
-            let end = (((b + 1) as f32 * per_bucket) as usize)
-                .max(start + 1)
-                .min(mono.len());
-            let slice = &mono[start.min(mono.len() - 1)..end];
+            let start = b * total / buckets;
+            let end = (((b + 1) * total / buckets).max(start + 1)).min(total);
             let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
-            for &s in slice {
+            for &s in &mono[start..end] {
                 min = min.min(s);
                 max = max.max(s);
             }
@@ -205,6 +204,27 @@ mod tests {
         let peaks = reduce_peaks(&[0.5, -0.5], 200);
         assert_eq!(peaks.len(), 200);
         assert!(peaks.iter().any(|&(min, _)| min == -0.5));
+    }
+
+    #[test]
+    fn few_chunks_are_spread_across_the_whole_width() {
+        let chunks: Vec<(f32, f32)> = (0..10).map(|i| (0.0, i as f32 / 10.0)).collect();
+        let peaks = reduce_chunk_peaks(&chunks, 200);
+        assert_eq!(peaks.len(), 200);
+
+        // The middle of the widget must show the middle chunk, not a repeat
+        // of the last chunk.
+        let mid = peaks[100].1;
+        assert!((mid - 0.5).abs() < 0.11, "middle bucket showed {mid}");
+        let end = peaks[199].1;
+        assert!((end - 0.9).abs() < 0.11, "last bucket showed {end}");
+    }
+
+    #[test]
+    fn short_sample_runs_are_not_stretched_to_one_tail_value() {
+        let samples: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
+        let peaks = reduce_peaks(&samples, 200);
+        assert!((peaks[150].1 - 0.75).abs() < 0.03, "got {}", peaks[150].1);
     }
 
     #[test]

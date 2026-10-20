@@ -1,8 +1,8 @@
-1 ICON "icon.ico"
+1 ICON "@ICON_PATH@"
 
 1 VERSIONINFO
-FILEVERSION 0,1,1,0
-PRODUCTVERSION 0,1,1,0
+FILEVERSION @FILE_VERSION@
+PRODUCTVERSION @FILE_VERSION@
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -15,12 +15,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Open Soundboard"
             VALUE "FileDescription", "Open Soundboard"
-            VALUE "FileVersion", "0.1.1"
+            VALUE "FileVersion", "@VERSION@"
             VALUE "InternalName", "open-soundboard"
             VALUE "LegalCopyright", "Open Soundboard Contributors"
             VALUE "OriginalFilename", "open-soundboard.exe"
             VALUE "ProductName", "Open Soundboard"
-            VALUE "ProductVersion", "0.1.1"
+            VALUE "ProductVersion", "@VERSION@"
         END
     END
     BLOCK "VarFileInfo"
