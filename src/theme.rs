@@ -8,12 +8,12 @@ pub const BORDER: Color32 = Color32::from_rgb(0x32, 0x37, 0x42);
 pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe9, 0xef);
 pub const MUTED: Color32 = Color32::from_rgb(0x96, 0x9e, 0xb0);
 
-pub const ACCENT: Color32 = Color32::from_rgb(0x3b, 0x82, 0xf6);
+pub const ACCENT: Color32 = Color32::from_rgb(0x25, 0x63, 0xeb);
 pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0x1e, 0x2c, 0x46);
 pub const GOOD: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
 pub const GOOD_SOFT: Color32 = Color32::from_rgb(0x1c, 0x46, 0x2c);
 pub const GOOD_TINT: Color32 = Color32::from_rgb(0x1a, 0x2a, 0x22);
-pub const DANGER: Color32 = Color32::from_rgb(0xef, 0x44, 0x44);
+pub const DANGER: Color32 = Color32::from_rgb(0xdc, 0x26, 0x26);
 pub const WARN: Color32 = Color32::from_rgb(0xf5, 0x9e, 0x0b);
 
 pub fn apply(ctx: &egui::Context) {

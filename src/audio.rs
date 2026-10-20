@@ -64,6 +64,7 @@ pub enum AudioEvent {
 pub fn spawn_audio_engine(
     initial_device: String,
     volume: f32,
+    ctx: egui::Context,
 ) -> (Sender<AudioCommand>, Receiver<AudioEvent>) {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AudioCommand>();
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<AudioEvent>();
@@ -71,7 +72,7 @@ pub fn spawn_audio_engine(
     std::thread::Builder::new()
         .name("audio-engine".to_owned())
         .spawn(move || {
-            run_engine(initial_device, volume, cmd_rx, event_tx);
+            run_engine(initial_device, volume, cmd_rx, event_tx, ctx);
         })
         .expect("failed to spawn audio engine thread");
 
@@ -81,6 +82,7 @@ pub fn spawn_audio_engine(
 struct Engine {
     cmd_rx: Receiver<AudioCommand>,
     event_tx: Sender<AudioEvent>,
+    ctx: egui::Context,
 
     sink: Option<MixerDeviceSink>,
     mixer: Option<Mixer>,
@@ -95,10 +97,12 @@ fn run_engine(
     volume: f32,
     cmd_rx: Receiver<AudioCommand>,
     event_tx: Sender<AudioEvent>,
+    ctx: egui::Context,
 ) {
     let mut engine = Engine {
         cmd_rx,
         event_tx,
+        ctx,
         sink: None,
         mixer: None,
         players: HashMap::new(),
@@ -130,11 +134,17 @@ impl Engine {
     fn emit(&self, event: AudioEvent) {
         if self.event_tx.send(event).is_err() {
             warn!("UI is gone; audio event dropped.");
+        } else {
+            self.ctx.request_repaint();
         }
     }
 
     fn open_device(&mut self, requested: &str) {
+        let old_ids: Vec<SlotId> = self.players.keys().copied().collect();
         self.players.clear();
+        for id in old_ids {
+            self.emit(AudioEvent::Finished(id));
+        }
 
         match open_sink_for(requested, &self.event_tx) {
             Ok(opened) => {
@@ -172,8 +182,9 @@ impl Engine {
             AudioCommand::Play { id, path, trim } => self.play_file(id, path, trim),
             AudioCommand::PlayTest => self.play_test_tone(),
             AudioCommand::Stop(id) => {
-                self.players.remove(&id);
-                self.emit(AudioEvent::Finished(id));
+                if self.players.remove(&id).is_some() {
+                    self.emit(AudioEvent::Finished(id));
+                }
             }
             AudioCommand::StopAll => {
                 let ids: Vec<SlotId> = self.players.keys().copied().collect();
@@ -361,7 +372,7 @@ fn open_stream(
         .map_err(|err| err.to_string())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn drain(rx: &Receiver<AudioEvent>) -> Vec<AudioEvent> {
     let mut out = Vec::new();
     while let Ok(event) = rx.try_recv() {
@@ -405,7 +416,11 @@ mod tests {
 
     #[test]
     fn missing_file_reports_without_needing_a_device() {
-        let (tx, rx) = spawn_audio_engine(SYSTEM_DEFAULT_LABEL.to_owned(), 0.7);
+        let (tx, rx) = spawn_audio_engine(
+            SYSTEM_DEFAULT_LABEL.to_owned(),
+            0.7,
+            egui::Context::default(),
+        );
 
         std::thread::sleep(Duration::from_millis(300));
         drain(&rx);
@@ -430,7 +445,11 @@ mod tests {
         let junk = dir.join("junk.mp3");
         std::fs::write(&junk, b"this is not audio at all").unwrap();
 
-        let (tx, rx) = spawn_audio_engine(SYSTEM_DEFAULT_LABEL.to_owned(), 0.7);
+        let (tx, rx) = spawn_audio_engine(
+            SYSTEM_DEFAULT_LABEL.to_owned(),
+            0.7,
+            egui::Context::default(),
+        );
         std::thread::sleep(Duration::from_millis(300));
         drain(&rx);
 
@@ -454,7 +473,11 @@ mod tests {
         let wav = dir.join("beep.wav");
         write_test_wav(&wav, 120);
 
-        let (tx, rx) = spawn_audio_engine(SYSTEM_DEFAULT_LABEL.to_owned(), 0.5);
+        let (tx, rx) = spawn_audio_engine(
+            SYSTEM_DEFAULT_LABEL.to_owned(),
+            0.5,
+            egui::Context::default(),
+        );
 
         let ready = next_event(&rx, Duration::from_secs(5));
         let Some(AudioEvent::DeviceReady { actual, .. }) = ready else {
@@ -490,7 +513,11 @@ mod tests {
         let wav = dir.join("long.wav");
         write_test_wav(&wav, 5000);
 
-        let (tx, rx) = spawn_audio_engine(SYSTEM_DEFAULT_LABEL.to_owned(), 0.5);
+        let (tx, rx) = spawn_audio_engine(
+            SYSTEM_DEFAULT_LABEL.to_owned(),
+            0.5,
+            egui::Context::default(),
+        );
 
         match next_event(&rx, Duration::from_secs(5)) {
             Some(AudioEvent::DeviceReady { actual, .. }) if !actual.is_empty() => {}

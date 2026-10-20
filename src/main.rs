@@ -7,6 +7,7 @@ mod devices;
 mod hotkey;
 mod icon_art;
 mod model;
+mod paths;
 mod record;
 mod theme;
 mod tray;

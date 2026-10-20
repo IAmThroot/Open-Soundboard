@@ -5,8 +5,6 @@ use rodio::{Decoder, Source};
 
 pub const WAVE_BUCKETS: usize = 200;
 
-const MAX_SAMPLES: usize = 60_000_000;
-
 #[derive(Clone, Debug)]
 pub struct Waveform {
     pub peaks: Vec<(f32, f32)>,
@@ -23,31 +21,105 @@ pub fn build_waveform(path: &Path) -> Result<Waveform, String> {
     let channels = decoder.channels().get() as usize;
     let sample_rate = decoder.sample_rate().get();
 
-    let mut mono: Vec<f32> = Vec::new();
-    let mut frame = vec![0.0f32; channels];
-    let mut filled = 0;
+    // Streaming reduction:
+    // To avoid allocating 120+ MB for long files, we accumulate frames in small chunks.
+    // Short files (<= 1024 frames) retain exact samples.
+    // Longer files compress to sub-chunk (min, max) pairs (~200 KB per 10 minutes).
+    const CHUNK_SIZE: usize = 512;
+    let mut initial_frames: Vec<f32> = Vec::new();
+    let mut chunk_peaks: Vec<(f32, f32)> = Vec::new();
+
+    let mut frame_sum = 0.0f32;
+    let mut frame_filled = 0;
+    let mut total_frames: usize = 0;
+
+    let mut current_chunk_min = f32::INFINITY;
+    let mut current_chunk_max = f32::NEG_INFINITY;
+    let mut current_chunk_len = 0;
+
     for sample in decoder {
-        frame[filled] = sample;
-        filled += 1;
-        if filled == channels {
-            mono.push(frame.iter().sum::<f32>() / channels as f32);
-            filled = 0;
-            if mono.len() * channels > MAX_SAMPLES {
-                return Err("That file is too long to preview (over ~10 minutes). It can still be played whole.".to_owned());
+        frame_sum += sample;
+        frame_filled += 1;
+        if frame_filled == channels {
+            let mono = frame_sum / channels as f32;
+            frame_sum = 0.0;
+            frame_filled = 0;
+            total_frames += 1;
+
+            if total_frames <= 1024 {
+                initial_frames.push(mono);
+            } else {
+                if !initial_frames.is_empty() {
+                    for chunk in initial_frames.chunks(CHUNK_SIZE) {
+                        let (mut mi, mut ma) = (f32::INFINITY, f32::NEG_INFINITY);
+                        for &s in chunk {
+                            mi = mi.min(s);
+                            ma = ma.max(s);
+                        }
+                        chunk_peaks.push((mi, ma));
+                    }
+                    initial_frames.clear();
+                }
+
+                current_chunk_min = current_chunk_min.min(mono);
+                current_chunk_max = current_chunk_max.max(mono);
+                current_chunk_len += 1;
+
+                if current_chunk_len == CHUNK_SIZE {
+                    chunk_peaks.push((current_chunk_min, current_chunk_max));
+                    current_chunk_min = f32::INFINITY;
+                    current_chunk_max = f32::NEG_INFINITY;
+                    current_chunk_len = 0;
+                }
             }
         }
     }
-    if mono.is_empty() {
+
+    if total_frames == 0 {
         return Err("That file contains no audible audio.".to_owned());
     }
 
-    let duration_secs = mono.len() as f32 / sample_rate as f32;
-    let peaks = reduce_peaks(&mono, WAVE_BUCKETS);
+    let duration_secs = total_frames as f32 / sample_rate as f32;
+
+    let peaks = if !initial_frames.is_empty() {
+        reduce_peaks(&initial_frames, WAVE_BUCKETS)
+    } else {
+        if current_chunk_len > 0 {
+            chunk_peaks.push((current_chunk_min, current_chunk_max));
+        }
+        reduce_chunk_peaks(&chunk_peaks, WAVE_BUCKETS)
+    };
 
     Ok(Waveform {
         peaks,
         duration_secs,
     })
+}
+
+fn reduce_chunk_peaks(chunks: &[(f32, f32)], buckets: usize) -> Vec<(f32, f32)> {
+    if chunks.is_empty() {
+        return vec![(0.0, 0.0); buckets];
+    }
+    let per_bucket = (chunks.len() as f32 / buckets as f32).max(1.0);
+    (0..buckets)
+        .map(|b| {
+            let start = (b as f32 * per_bucket) as usize;
+            let end = (((b + 1) as f32 * per_bucket) as usize)
+                .max(start + 1)
+                .min(chunks.len());
+            let slice = &chunks[start.min(chunks.len() - 1)..end];
+            let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+            for &(c_min, c_max) in slice {
+                min = min.min(c_min);
+                max = max.max(c_max);
+            }
+            if min.is_infinite() {
+                (0.0, 0.0)
+            } else {
+                (min, max)
+            }
+        })
+        .collect()
 }
 
 fn reduce_peaks(mono: &[f32], buckets: usize) -> Vec<(f32, f32)> {
@@ -78,13 +150,20 @@ pub fn trim_durations(
     end_frac: f32,
     duration_secs: f32,
 ) -> Option<(Duration, Duration)> {
+    if !start_frac.is_finite()
+        || !end_frac.is_finite()
+        || !duration_secs.is_finite()
+        || duration_secs <= 0.0
+    {
+        return None;
+    }
     let start = start_frac.clamp(0.0, 1.0);
     let end = end_frac.clamp(start, 1.0);
     if start <= 0.0 && end >= 1.0 {
         return None;
     }
-    let skip = Duration::from_secs_f32(start * duration_secs);
-    let take = Duration::from_secs_f32((end - start) * duration_secs);
+    let skip = Duration::try_from_secs_f32(start * duration_secs).ok()?;
+    let take = Duration::try_from_secs_f32((end - start) * duration_secs).ok()?;
     Some((skip, take))
 }
 
@@ -209,5 +288,15 @@ mod tests {
         std::fs::write(&path, b"not audio").unwrap();
         let err = build_waveform(&path).expect_err("must fail");
         assert!(err.contains("decoded"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_trim_floats_fall_back_without_panic() {
+        assert!(trim_durations(f32::NAN, 0.5, 10.0).is_none());
+        assert!(trim_durations(0.0, f32::NAN, 10.0).is_none());
+        assert!(trim_durations(0.0, 0.5, f32::NAN).is_none());
+        assert!(trim_durations(0.0, 0.5, f32::INFINITY).is_none());
+        assert!(trim_durations(0.0, 0.5, -5.0).is_none());
+        assert!(trim_durations(0.0, 0.5, 1e38).is_none());
     }
 }

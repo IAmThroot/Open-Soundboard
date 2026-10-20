@@ -12,68 +12,54 @@ pub fn device_display_name(device: &cpal::Device) -> Option<String> {
         .ok()
 }
 
-pub fn list_output_devices() -> Vec<String> {
+fn list_devices<I, E>(devices: Result<I, E>, kind: &str) -> Vec<String>
+where
+    I: IntoIterator<Item = cpal::Device>,
+    E: std::fmt::Display,
+{
     let mut names = vec![SYSTEM_DEFAULT_LABEL.to_owned()];
-
-    let host = cpal::default_host();
-    match host.output_devices() {
-        Ok(devices) => {
-            for device in devices {
+    match devices {
+        Ok(iter) => {
+            for device in iter {
                 match device_display_name(&device) {
                     Some(name) => {
                         if !names.contains(&name) {
                             names.push(name);
                         }
                     }
-                    None => warn!("Skipping output device with unreadable name"),
+                    None => warn!("Skipping {kind} device with unreadable name"),
                 }
             }
         }
-        Err(err) => warn!("Could not enumerate output devices: {err}"),
+        Err(err) => warn!("Could not enumerate {kind} devices: {err}"),
     }
-
     names
+}
+
+fn find_device<I, E>(devices: Result<I, E>, name: &str) -> Option<cpal::Device>
+where
+    I: Iterator<Item = cpal::Device>,
+{
+    if name == SYSTEM_DEFAULT_LABEL {
+        return None;
+    }
+    devices
+        .ok()?
+        .find(|device| device_display_name(device).as_deref() == Some(name))
+}
+
+pub fn list_output_devices() -> Vec<String> {
+    list_devices(cpal::default_host().output_devices(), "output")
 }
 
 pub fn find_device_by_name(name: &str) -> Option<cpal::Device> {
-    if name == SYSTEM_DEFAULT_LABEL {
-        return None;
-    }
-    cpal::default_host()
-        .output_devices()
-        .ok()?
-        .find(|device| device_display_name(device).as_deref() == Some(name))
+    find_device(cpal::default_host().output_devices(), name)
 }
 
 pub fn list_input_devices() -> Vec<String> {
-    let mut names = vec![SYSTEM_DEFAULT_LABEL.to_owned()];
-
-    let host = cpal::default_host();
-    match host.input_devices() {
-        Ok(devices) => {
-            for device in devices {
-                match device_display_name(&device) {
-                    Some(name) => {
-                        if !names.contains(&name) {
-                            names.push(name);
-                        }
-                    }
-                    None => warn!("Skipping input device with unreadable name"),
-                }
-            }
-        }
-        Err(err) => warn!("Could not enumerate input devices: {err}"),
-    }
-
-    names
+    list_devices(cpal::default_host().input_devices(), "input")
 }
 
 pub fn find_input_device_by_name(name: &str) -> Option<cpal::Device> {
-    if name == SYSTEM_DEFAULT_LABEL {
-        return None;
-    }
-    cpal::default_host()
-        .input_devices()
-        .ok()?
-        .find(|device| device_display_name(device).as_deref() == Some(name))
+    find_device(cpal::default_host().input_devices(), name)
 }

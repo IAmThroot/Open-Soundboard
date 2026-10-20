@@ -1,15 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
-
 #[path = "../src/icon_art.rs"]
 mod icon_art;
 

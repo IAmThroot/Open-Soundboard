@@ -54,18 +54,19 @@ pub enum RecordEvent {
     Failed(String),
 }
 
-pub fn spawn_recorder() -> (Sender<RecordCommand>, Receiver<RecordEvent>) {
+pub fn spawn_recorder(ctx: egui::Context) -> (Sender<RecordCommand>, Receiver<RecordEvent>) {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<RecordCommand>();
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<RecordEvent>();
 
     std::thread::Builder::new()
         .name("mic-recorder".to_owned())
-        .spawn(move || run_recorder(cmd_rx, event_tx))
+        .spawn(move || run_recorder(cmd_rx, event_tx, ctx))
         .expect("failed to spawn recorder thread");
 
     (cmd_tx, event_rx)
 }
 
+#[cfg(test)]
 pub fn encode_wav(
     samples: &[f32],
     channels: u16,
@@ -93,9 +94,7 @@ pub fn encode_wav(
 }
 
 fn recordings_dir() -> Result<PathBuf, String> {
-    let dirs = directories::ProjectDirs::from("com", "OpenSoundboard", "Open Soundboard")
-        .ok_or_else(|| "No home directory found.".to_owned())?;
-    Ok(dirs.data_dir().join(RECORDINGS_DIR))
+    crate::paths::recordings_dir()
 }
 
 fn stamp_name_in(dir: &std::path::Path) -> String {
@@ -122,10 +121,14 @@ fn stamp_name() -> String {
     stamp_name_in(&dir)
 }
 
-fn run_recorder(cmd_rx: Receiver<RecordCommand>, event_tx: Sender<RecordEvent>) {
+fn run_recorder(
+    cmd_rx: Receiver<RecordCommand>,
+    event_tx: Sender<RecordEvent>,
+    ctx: egui::Context,
+) {
     loop {
         match cmd_rx.recv() {
-            Ok(RecordCommand::Start(device)) => record_once(&cmd_rx, &event_tx, device),
+            Ok(RecordCommand::Start(device)) => record_once(&cmd_rx, &event_tx, &ctx, device),
             Ok(RecordCommand::Stop) => {}
             Err(_) => {
                 info!("UI hung up; recorder shutting down.");
@@ -138,6 +141,7 @@ fn run_recorder(cmd_rx: Receiver<RecordCommand>, event_tx: Sender<RecordEvent>) 
 fn record_once(
     cmd_rx: &Receiver<RecordCommand>,
     event_tx: &Sender<RecordEvent>,
+    ctx: &egui::Context,
     wanted: Option<String>,
 ) {
     let emit = |event: RecordEvent| {
@@ -146,6 +150,8 @@ fn record_once(
         }
         if event_tx.send(event).is_err() {
             warn!("UI is gone; record event dropped.");
+        } else {
+            ctx.request_repaint();
         }
     };
 
@@ -272,14 +278,47 @@ fn record_once(
         return;
     }
 
+    let dir = match recordings_dir() {
+        Ok(dir) => dir,
+        Err(message) => {
+            drop(stream);
+            emit(RecordEvent::Failed(message));
+            return;
+        }
+    };
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        drop(stream);
+        emit(RecordEvent::Failed(format!(
+            "Could not create the recordings folder: {err}."
+        )));
+        return;
+    }
+    let path = dir.join(stamp_name());
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = match hound::WavWriter::create(&path, spec) {
+        Ok(w) => w,
+        Err(err) => {
+            drop(stream);
+            emit(RecordEvent::Failed(format!(
+                "Failed to create recording WAV file: {err}."
+            )));
+            return;
+        }
+    };
+
     emit(RecordEvent::Started {
         device: device_name.clone(),
     });
 
-    let mut samples: Vec<f32> = Vec::new();
     let max_samples = (MAX_RECORDING.as_secs() as usize)
         .saturating_mul(sample_rate as usize)
         .saturating_mul(channels as usize);
+    let mut total_samples = 0usize;
     let mut capped = false;
     let mut ui_gone = false;
     let began = Instant::now();
@@ -304,19 +343,48 @@ fn record_once(
             break;
         }
         while let Ok(chunk) = chunk_rx.try_recv() {
-            if samples.len() + chunk.len() > max_samples {
-                capped = true;
+            for &s in &chunk {
+                if total_samples >= max_samples {
+                    capped = true;
+                    break;
+                }
+                let clamped = s.clamp(-1.0, 1.0);
+                let sample = (clamped * i16::MAX as f32) as i16;
+                let _ = writer.write_sample(sample);
+                total_samples += 1;
+            }
+            if capped {
                 break;
             }
-            samples.extend_from_slice(&chunk);
         }
         if capped {
             break;
         }
     }
+
+    if !ui_gone {
+        while let Ok(chunk) = chunk_rx.try_recv() {
+            for &s in &chunk {
+                if total_samples >= max_samples {
+                    capped = true;
+                    break;
+                }
+                let clamped = s.clamp(-1.0, 1.0);
+                let sample = (clamped * i16::MAX as f32) as i16;
+                let _ = writer.write_sample(sample);
+                total_samples += 1;
+            }
+            if capped {
+                break;
+            }
+        }
+    }
+
     drop(stream);
 
     if ui_gone {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
         info!("UI gone; discarding the unfinished take.");
         return;
     }
@@ -327,7 +395,9 @@ fn record_once(
     }
 
     let death = death_reason(&died);
-    if samples.is_empty() {
+    if total_samples == 0 {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
         let message = match &death {
             Some(reason) => {
                 format!("The microphone ({device_name}) stopped unexpectedly ({reason}).")
@@ -337,6 +407,15 @@ fn record_once(
         emit(RecordEvent::Failed(message));
         return;
     }
+
+    if let Err(err) = writer.finalize() {
+        let _ = std::fs::remove_file(&path);
+        emit(RecordEvent::Failed(format!(
+            "Failed to finalize recording WAV file: {err}."
+        )));
+        return;
+    }
+
     if let Some(reason) = &death {
         info!("Stream died mid-take ({reason}); keeping the partial recording.");
     }
@@ -344,27 +423,8 @@ fn record_once(
         info!("Recording hit the 10-minute cap; auto-stopped.");
     }
 
-    let dir = match recordings_dir() {
-        Ok(dir) => dir,
-        Err(message) => {
-            emit(RecordEvent::Failed(message));
-            return;
-        }
-    };
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        emit(RecordEvent::Failed(format!(
-            "Could not create the recordings folder: {err}."
-        )));
-        return;
-    }
-    let path = dir.join(stamp_name());
-    if let Err(message) = encode_wav(&samples, channels, sample_rate, &path) {
-        emit(RecordEvent::Failed(message));
-        return;
-    }
-
-    let cut_short = death.is_some();
-    let frames = samples.len() / channels.max(1) as usize;
+    let cut_short = death.is_some() || dropped > 0;
+    let frames = total_samples / channels.max(1) as usize;
     let duration_secs = frames as f32 / sample_rate as f32;
     info!("Recording saved: {} ({duration_secs:.1}s).", path.display());
     emit(RecordEvent::Saved {
@@ -453,7 +513,7 @@ mod tests {
             eprintln!("SKIP: no input device on this machine");
             return;
         }
-        let (cmd_tx, event_rx) = spawn_recorder();
+        let (cmd_tx, event_rx) = spawn_recorder(egui::Context::default());
         cmd_tx.send(RecordCommand::Start(None)).unwrap();
 
         let started = event_rx.recv_timeout(Duration::from_secs(10));

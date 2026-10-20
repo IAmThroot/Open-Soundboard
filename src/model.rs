@@ -130,9 +130,7 @@ impl SoundSlot {
         self.trim_end = 1.0;
         self.duration_secs = None;
     }
-}
 
-impl SoundSlot {
     pub fn with_file(id: SlotId, name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         Self {
             id,

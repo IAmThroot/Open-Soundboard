@@ -76,13 +76,14 @@ pub enum HotkeyEvent {
 
 pub fn spawn_hotkey_thread(
     audio_tx: Sender<AudioCommand>,
+    ctx: egui::Context,
 ) -> (Sender<HotkeyCommand>, Receiver<HotkeyEvent>) {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<HotkeyCommand>();
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<HotkeyEvent>();
 
     std::thread::Builder::new()
         .name("hotkey-listener".to_owned())
-        .spawn(move || run_listener(cmd_rx, event_tx, audio_tx))
+        .spawn(move || run_listener(cmd_rx, event_tx, audio_tx, ctx))
         .expect("failed to spawn hotkey listener thread");
 
     (cmd_tx, event_rx)
@@ -198,6 +199,7 @@ fn run_listener(
     cmd_rx: Receiver<HotkeyCommand>,
     event_tx: Sender<HotkeyEvent>,
     audio_tx: Sender<AudioCommand>,
+    ctx: egui::Context,
 ) {
     let manager = match GlobalHotKeyManager::new() {
         Ok(manager) => manager,
@@ -206,6 +208,7 @@ fn run_listener(
             let _ = event_tx.send(HotkeyEvent::Unavailable(format!(
                 "System-wide hotkeys aren't available here ({err}). You can still click ▶ to play sounds."
             )));
+            ctx.request_repaint();
 
             while cmd_rx.recv().is_ok() {}
             return;
@@ -213,12 +216,27 @@ fn run_listener(
     };
 
     let _ = event_tx.send(HotkeyEvent::Ready);
+    ctx.request_repaint();
     info!("Global hotkey backend ready.");
 
     let mut grabbed: Vec<GlobalKey> = Vec::new();
     let mut routing: HashMap<u32, Vec<PressTarget>> = HashMap::new();
 
     loop {
+        if grabbed.is_empty() {
+            // M7: No hotkeys registered; completely sleep until a UI command arrives
+            match cmd_rx.recv() {
+                Ok(HotkeyCommand::Rebuild(bindings)) => {
+                    rebuild(&manager, &event_tx, &ctx, &mut grabbed, &mut routing, bindings);
+                }
+                Err(_) => {
+                    info!("UI hung up; hotkey listener shutting down.");
+                    break;
+                }
+            }
+            continue;
+        }
+
         pump_win32_messages();
 
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
@@ -234,20 +252,37 @@ fn run_listener(
             }
         }
 
-        match cmd_rx.recv_timeout(PUMP_INTERVAL) {
+        match cmd_rx.try_recv() {
             Ok(HotkeyCommand::Rebuild(bindings)) => {
-                rebuild(&manager, &event_tx, &mut grabbed, &mut routing, bindings);
+                rebuild(&manager, &event_tx, &ctx, &mut grabbed, &mut routing, bindings);
+                continue;
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 info!("UI hung up; hotkey listener shutting down.");
                 break;
             }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
+
+        wait_for_message_or_timeout(WAIT_INTERVAL);
     }
 }
 
-const PUMP_INTERVAL: Duration = Duration::from_millis(20);
+const WAIT_INTERVAL: Duration = Duration::from_millis(100);
+
+#[cfg(windows)]
+fn wait_for_message_or_timeout(dur: Duration) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjects, QS_ALLINPUT};
+    let ms = dur.as_millis().min(u32::MAX as u128) as u32;
+    unsafe {
+        MsgWaitForMultipleObjects(0, std::ptr::null(), 0, ms, QS_ALLINPUT);
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_message_or_timeout(dur: Duration) {
+    std::thread::sleep(dur);
+}
 
 #[cfg(windows)]
 fn pump_win32_messages() {
@@ -271,19 +306,29 @@ fn pump_win32_messages() {}
 fn rebuild(
     manager: &GlobalHotKeyManager,
     event_tx: &Sender<HotkeyEvent>,
+    ctx: &egui::Context,
     grabbed: &mut Vec<GlobalKey>,
     routing: &mut HashMap<u32, Vec<PressTarget>>,
     bindings: Vec<HotkeyBinding>,
 ) {
     if !grabbed.is_empty() {
-        let _ = manager.unregister_all(grabbed);
-        grabbed.clear();
+        // L11: Unregister keys individually and track failures to prevent leaking OS grabs
+        let mut failed = Vec::new();
+        for key in grabbed.drain(..) {
+            if let Err(err) = manager.unregister(key) {
+                warn!("Failed to unregister hotkey {}: {err}", key.id());
+                failed.push(key);
+            }
+        }
+        *grabbed = failed;
     }
     routing.clear();
 
     let (by_key, rejected) = group_bindings(bindings);
+    let mut sent_event = false;
     for (display, reason) in rejected {
         let _ = event_tx.send(HotkeyEvent::KeyRejected { display, reason });
+        sent_event = true;
     }
 
     for (key, slots) in by_key {
@@ -300,10 +345,14 @@ fn rebuild(
                          Pick a different key."
                     ),
                 });
+                sent_event = true;
             }
         }
     }
 
+    if sent_event {
+        ctx.request_repaint();
+    }
     info!("Hotkey rebuild complete: {} OS grabs.", grabbed.len());
 }
 
@@ -365,156 +414,29 @@ fn dispatch_press(
 fn key_to_display(key: &GlobalKey) -> String {
     let mut parts = Vec::new();
     if key.mods.contains(Modifiers::CONTROL) {
-        parts.push("Ctrl");
+        parts.push("Ctrl".to_string());
     }
     if key.mods.contains(Modifiers::ALT) {
-        parts.push("Alt");
+        parts.push("Alt".to_string());
     }
     if key.mods.contains(Modifiers::SHIFT) {
-        parts.push("Shift");
+        parts.push("Shift".to_string());
     }
     if key.mods.contains(Modifiers::SUPER) {
-        parts.push("Win");
+        parts.push("Win".to_string());
     }
     parts.push(code_label(&key.key));
     parts.join("+")
 }
 
-fn code_label(code: &Code) -> &'static str {
+fn code_label(code: &Code) -> String {
     match code {
-        Code::Space => "Space",
-        Code::ArrowDown => "Down",
-        Code::ArrowLeft => "Left",
-        Code::ArrowRight => "Right",
-        Code::ArrowUp => "Up",
-        _ => code_name(*code),
-    }
-}
-
-fn code_name(code: Code) -> &'static str {
-    match code {
-        Code::Backquote => "Backquote",
-        Code::Backslash => "Backslash",
-        Code::BracketLeft => "BracketLeft",
-        Code::BracketRight => "BracketRight",
-        Code::Comma => "Comma",
-        Code::Digit0 => "Digit0",
-        Code::Digit1 => "Digit1",
-        Code::Digit2 => "Digit2",
-        Code::Digit3 => "Digit3",
-        Code::Digit4 => "Digit4",
-        Code::Digit5 => "Digit5",
-        Code::Digit6 => "Digit6",
-        Code::Digit7 => "Digit7",
-        Code::Digit8 => "Digit8",
-        Code::Digit9 => "Digit9",
-        Code::Equal => "Equal",
-        Code::Minus => "Minus",
-        Code::Period => "Period",
-        Code::Quote => "Quote",
-        Code::Semicolon => "Semicolon",
-        Code::Slash => "Slash",
-        Code::Backspace => "Backspace",
-        Code::CapsLock => "CapsLock",
-        Code::ContextMenu => "ContextMenu",
-        Code::Enter => "Enter",
-        Code::Space => "Space",
-        Code::Tab => "Tab",
-        Code::Delete => "Delete",
-        Code::End => "End",
-        Code::Help => "Help",
-        Code::Home => "Home",
-        Code::Insert => "Insert",
-        Code::PageDown => "PageDown",
-        Code::PageUp => "PageUp",
-        Code::ArrowDown => "ArrowDown",
-        Code::ArrowLeft => "ArrowLeft",
-        Code::ArrowRight => "ArrowRight",
-        Code::ArrowUp => "ArrowUp",
-        Code::NumLock => "NumLock",
-        Code::Escape => "Escape",
-        Code::PrintScreen => "PrintScreen",
-        Code::ScrollLock => "ScrollLock",
-        Code::Pause => "Pause",
-        Code::BrowserBack => "BrowserBack",
-        Code::BrowserFavorites => "BrowserFavorites",
-        Code::BrowserForward => "BrowserForward",
-        Code::BrowserHome => "BrowserHome",
-        Code::BrowserRefresh => "BrowserRefresh",
-        Code::BrowserSearch => "BrowserSearch",
-        Code::BrowserStop => "BrowserStop",
-        Code::LaunchApp1 => "LaunchApp1",
-        Code::LaunchApp2 => "LaunchApp2",
-        Code::LaunchMail => "LaunchMail",
-        Code::MediaPlayPause => "MediaPlayPause",
-        Code::MediaStop => "MediaStop",
-        Code::MediaTrackNext => "MediaTrackNext",
-        Code::MediaTrackPrevious => "MediaTrackPrevious",
-        Code::AudioVolumeDown => "AudioVolumeDown",
-        Code::AudioVolumeMute => "AudioVolumeMute",
-        Code::AudioVolumeUp => "AudioVolumeUp",
-        Code::KeyA => "KeyA",
-        Code::KeyB => "KeyB",
-        Code::KeyC => "KeyC",
-        Code::KeyD => "KeyD",
-        Code::KeyE => "KeyE",
-        Code::KeyF => "KeyF",
-        Code::KeyG => "KeyG",
-        Code::KeyH => "KeyH",
-        Code::KeyI => "KeyI",
-        Code::KeyJ => "KeyJ",
-        Code::KeyK => "KeyK",
-        Code::KeyL => "KeyL",
-        Code::KeyM => "KeyM",
-        Code::KeyN => "KeyN",
-        Code::KeyO => "KeyO",
-        Code::KeyP => "KeyP",
-        Code::KeyQ => "KeyQ",
-        Code::KeyR => "KeyR",
-        Code::KeyS => "KeyS",
-        Code::KeyT => "KeyT",
-        Code::KeyU => "KeyU",
-        Code::KeyV => "KeyV",
-        Code::KeyW => "KeyW",
-        Code::KeyX => "KeyX",
-        Code::KeyY => "KeyY",
-        Code::KeyZ => "KeyZ",
-        Code::F1 => "F1",
-        Code::F2 => "F2",
-        Code::F3 => "F3",
-        Code::F4 => "F4",
-        Code::F5 => "F5",
-        Code::F6 => "F6",
-        Code::F7 => "F7",
-        Code::F8 => "F8",
-        Code::F9 => "F9",
-        Code::F10 => "F10",
-        Code::F11 => "F11",
-        Code::F12 => "F12",
-        Code::F13 => "F13",
-        Code::F14 => "F14",
-        Code::F15 => "F15",
-        Code::F16 => "F16",
-        Code::F17 => "F17",
-        Code::F18 => "F18",
-        Code::F19 => "F19",
-        Code::F20 => "F20",
-        Code::F21 => "F21",
-        Code::F22 => "F22",
-        Code::F23 => "F23",
-        Code::F24 => "F24",
-        Code::Numpad0 => "Numpad0",
-        Code::Numpad1 => "Numpad1",
-        Code::Numpad2 => "Numpad2",
-        Code::Numpad3 => "Numpad3",
-        Code::Numpad4 => "Numpad4",
-        Code::Numpad5 => "Numpad5",
-        Code::Numpad6 => "Numpad6",
-        Code::Numpad7 => "Numpad7",
-        Code::Numpad8 => "Numpad8",
-        Code::Numpad9 => "Numpad9",
-        Code::NumpadMultiply => "NumpadMultiply",
-        _ => "key",
+        Code::Space => "Space".to_owned(),
+        Code::ArrowDown => "Down".to_owned(),
+        Code::ArrowLeft => "Left".to_owned(),
+        Code::ArrowRight => "Right".to_owned(),
+        Code::ArrowUp => "Up".to_owned(),
+        _ => format!("{code:?}"),
     }
 }
 

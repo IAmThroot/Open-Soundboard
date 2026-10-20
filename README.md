@@ -22,14 +22,14 @@ Designed for gamers, streamers, podcasters, and everyday users who want a soundb
   Select your audio output device on the fly—route clips through your headset for personal listening or through a virtual audio cable (like VB-Cable) to broadcast to voice chat. Features a master volume slider and a universal panic/stop hotkey you can bind to any key.
 - ** System Tray Integration**  
   Keep your taskbar uncluttered. Enable "Close to Tray" in Settings so the app runs unobtrusively in the background while keeping all global hotkeys fully active.
-- ** Automatic Atomic Persistence**  
-  No manual save buttons. Your boards, sound configurations, volume levels, and hotkey bindings are saved atomically to `%APPDATA%`, preventing config corruption even during unexpected shutdowns.
-- ** Ultra-Lightweight & Native**  
-  Written 100% in Rust using `eframe`/`egui`, `rodio`, and `cpal`. Consumes ~0% CPU at idle and starts instantly.
+- **💾 Automatic Atomic Persistence**  
+  No manual save buttons. Your boards, sound configurations, volume levels, and hotkey bindings are saved atomically to `%APPDATA%\OpenSoundboard\Open Soundboard\config\config.json`, preventing config corruption even during unexpected shutdowns.
+- **⚡ Ultra-Lightweight & Native**  
+  Written 100% in Rust using `eframe`/`egui`, `rodio`, and `cpal`. Consumes 0% CPU at idle and starts instantly.
 
 ---
 
-##  Installation Guide
+## 📦 Installation Guide
 
 Open Soundboard runs on **64-bit Windows 10 and Windows 11**.
 
@@ -41,7 +41,7 @@ Open Soundboard runs on **64-bit Windows 10 and Windows 11**.
    - Optionally check the box to create a Desktop shortcut.
 3. Launch Open Soundboard from your Start Menu or Desktop.
 
-> **Upgrading / Uninstalling:** When you update or uninstall Open Soundboard, your boards, settings, and custom mic recordings are stored safely in `%APPDATA%\OpenSoundboard` and will remain intact.
+> **Upgrading / Uninstalling:** When you update or uninstall Open Soundboard, your boards, settings, and custom mic recordings are stored safely in `%APPDATA%\OpenSoundboard\Open Soundboard` and will remain intact.
 
 ### Option 2: Portable Zip
 
@@ -78,12 +78,12 @@ iscc /DMyAppVersion=0.1.1 packaging\installer.iss
 
 ---
 
-##  Usage Guide
+## 📖 Usage Guide
 
 ### 1. Adding Sounds
-- Click **+ Add Sound** on any empty tile.
-- Browse and select your audio file (`.mp3`, `.wav`, `.ogg`, or `.flac`).
-- Enter a display label for the sound tile.
+- Click **+ Add Sound** on any empty tile or in the top toolbar.
+- Browse and select your audio file (`.mp3`, `.wav`, `.ogg`, `.flac`, `.m4a`, or `.aac`).
+- The tile automatically derives its label from the audio file name.
 
 ### 2. Binding Global Hotkeys
 - Click the **[Set Key]** button on any sound tile.
@@ -102,14 +102,14 @@ To play sounds into voice chat so your friends or teammates can hear them:
 - Click the **✎** (edit) icon on any sound tile.
 - An interactive waveform modal will appear.
 - Drag the **blue start handle** and **blue end handle** to isolate the exact section of the sound you want.
-- Click **▶ Play Preview** to test your trim boundaries.
+- Click **▶ Play** to test your trim boundaries.
 - Click **Save**. Hotkeys and clicks will now play only the trimmed segment.
 
 ### 5. Recording from your Microphone
 - In the top toolbar, select your physical microphone from the input picker.
 - Click **Record**. Speak or play the sound you wish to capture.
 - Click **Stop Recording**.
-- The recording is instantly encoded and saved to `%APPDATA%\OpenSoundboard\data\recordings\`, and a new tile is added to your board ready for hotkey assignment.
+- The recording is streamed directly to `%APPDATA%\OpenSoundboard\Open Soundboard\data\recordings\`, and a new tile is added to your board ready for hotkey assignment.
 
 ### 6. System Tray & Background Operation
 - Click the **⚙ (Settings)** button in the toolbar.
@@ -121,7 +121,7 @@ To play sounds into voice chat so your friends or teammates can hear them:
 
 ## ⚠ Limitations & Notes
 
-- **Supported Formats:** Open Soundboard decodes **MP3, WAV, OGG (Vorbis), and FLAC**. Formats requiring external proprietary codecs (such as Opus or AAC/M4A) are not supported out of the box; convert them to MP3 or WAV before adding.
+- **Supported Formats:** Open Soundboard decodes **MP3, WAV, OGG (Vorbis), FLAC, and common AAC/M4A audio containers**.
 - **Administrator Privileges & Games:** Windows security isolates elevated (Administrator) windows from non-elevated windows. If you are playing a game running in Administrator mode (common for games with kernel-level anti-cheat), launch Open Soundboard as Administrator so Windows allows hotkeys to register across the game.
 - **Platform Scope:** The core audio engine and UI are cross-platform Rust, but system-wide global hotkeys (`RegisterHotKey`) and the system tray notification icon are tailored specifically for **Windows**.
 

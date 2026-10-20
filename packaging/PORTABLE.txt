@@ -11,7 +11,7 @@ Your boards, sounds and microphone recordings are NOT inside this folder.
 They are stored per-user in:
 
     %APPDATA%\OpenSoundboard\Open Soundboard\
-        config.json        (boards, hotkeys, volume, device choices)
+        config\config.json (boards, hotkeys, volume, device choices)
         data\recordings\   (microphone takes)
 
 Because that folder is separate from the app, you can move this portable

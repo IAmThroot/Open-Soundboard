@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Board, Hotkey, SlotId, SoundSlot};
+use crate::model::{Board, BoardId, Hotkey, SlotId, SoundSlot};
 
 pub const CONFIG_VERSION: u32 = 1;
 
 pub const STATE_VERSION: u32 = 2;
-const CONFIG_FILE_NAME: &str = "config.json";
+pub const CONFIG_FILE_NAME: &str = "config.json";
 const BACKUP_SUFFIX: &str = "json.bak";
 const V1_BACKUP_SUFFIX: &str = "json.v1.bak";
 
@@ -79,12 +79,21 @@ impl Default for AppState {
 }
 
 pub fn config_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("com", "OpenSoundboard", "Open Soundboard")?;
-    Some(dirs.config_dir().join(CONFIG_FILE_NAME))
+    crate::paths::config_path()
 }
 
-pub fn load() -> Option<AppState> {
-    load_from(&config_path()?)
+#[derive(Debug)]
+pub enum LoadOutcome {
+    CleanFresh,
+    Loaded(AppState),
+    ReadError(String),
+}
+
+pub fn load() -> LoadOutcome {
+    let Some(path) = config_path() else {
+        return LoadOutcome::CleanFresh;
+    };
+    load_outcome_from(&path)
 }
 
 pub fn save(state: &AppState) -> Result<(), String> {
@@ -94,13 +103,39 @@ pub fn save(state: &AppState) -> Result<(), String> {
     )
 }
 
+#[cfg(test)]
 fn load_from(path: &Path) -> Option<AppState> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(err) => {
-            warn!("Could not read config {}: {err}", path.display());
-            return None;
+    match load_outcome_from(path) {
+        LoadOutcome::Loaded(state) => Some(state),
+        _ => None,
+    }
+}
+
+fn load_outcome_from(path: &Path) -> LoadOutcome {
+    let mut last_err = None;
+    let mut bytes = None;
+    for _ in 0..3 {
+        match std::fs::read(path) {
+            Ok(b) => {
+                bytes = Some(b);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return LoadOutcome::CleanFresh;
+            }
+            Err(err) => {
+                last_err = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+
+    let bytes = match bytes {
+        Some(b) => b,
+        None => {
+            let err = last_err.unwrap();
+            warn!("Could not read config {} after 3 attempts: {err}", path.display());
+            return LoadOutcome::ReadError(format!("Could not read config: {err}"));
         }
     };
 
@@ -112,15 +147,15 @@ fn load_from(path: &Path) -> Option<AppState> {
                 path.display()
             );
             backup(path, BACKUP_SUFFIX);
-            return None;
+            return LoadOutcome::CleanFresh;
         }
     };
 
     match value.get("version").and_then(serde_json::Value::as_u64) {
-        Some(v) if v as u32 == STATE_VERSION => match serde_json::from_value::<AppState>(value) {
+        Some(v) if v == STATE_VERSION as u64 => match serde_json::from_value::<AppState>(value) {
             Ok(state) => {
                 info!("Loaded state ({} boards).", state.boards.len());
-                Some(sanitize_state(state))
+                LoadOutcome::Loaded(sanitize_state(state))
             }
             Err(err) => {
                 warn!(
@@ -128,10 +163,10 @@ fn load_from(path: &Path) -> Option<AppState> {
                     path.display()
                 );
                 backup(path, BACKUP_SUFFIX);
-                None
+                LoadOutcome::CleanFresh
             }
         },
-        Some(v) if v as u32 == CONFIG_VERSION => {
+        Some(v) if v == CONFIG_VERSION as u64 => {
             match serde_json::from_slice::<AppConfig>(&bytes) {
                 Ok(v1) => {
                     info!("Migrating version-1 config to version 2.");
@@ -145,7 +180,7 @@ fn load_from(path: &Path) -> Option<AppState> {
                     if let Err(err) = save_to(path, &state) {
                         warn!("Could not write migrated config: {err}");
                     }
-                    Some(state)
+                    LoadOutcome::Loaded(state)
                 }
                 Err(err) => {
                     warn!(
@@ -153,39 +188,77 @@ fn load_from(path: &Path) -> Option<AppState> {
                         path.display()
                     );
                     backup(path, BACKUP_SUFFIX);
-                    None
+                    LoadOutcome::CleanFresh
                 }
             }
         }
         other => {
             warn!("Config version {other:?} is not supported; starting fresh.");
             backup(path, BACKUP_SUFFIX);
-            None
+            LoadOutcome::CleanFresh
         }
     }
 }
 
 fn save_to(path: &Path, state: &AppState) -> Result<(), String> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|err| format!("Could not encode config: {err}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)
-        .map_err(|err| format!("Could not write {}: {err}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|err| format!("Could not publish {}: {err}", path.display()))?;
+
+    let pid = std::process::id();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("json.tmp.{pid}.{nonce}"));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Could not write {}: {err}", tmp.display()));
+    }
+
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Could not publish {}: {err}", path.display()));
+    }
+
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
     Ok(())
 }
 
 fn backup(path: &Path, suffix: &str) {
-    let backup = path.with_extension(suffix);
-    if let Err(err) = std::fs::rename(path, &backup) {
+    let backup_path = path.with_extension(suffix);
+    if backup_path.exists() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let extra = path.with_extension(format!("{suffix}.{ts}"));
+        if let Err(err) = std::fs::copy(&backup_path, &extra) {
+            warn!("Could not archive previous backup {}: {err}", backup_path.display());
+        }
+    }
+    if let Err(err) = std::fs::rename(path, &backup_path) {
         warn!("Could not back up {}: {err}", path.display());
     } else {
-        info!("Backed up {} to {}.", path.display(), backup.display());
+        info!("Backed up {} to {}.", path.display(), backup_path.display());
     }
 }
 
@@ -220,13 +293,51 @@ fn migrate_v1(v1: AppConfig) -> AppState {
 fn sanitize_state(mut state: AppState) -> AppState {
     state.volume = state.volume.clamp(0.0, 1.0);
     state.version = STATE_VERSION;
-    for board in &mut state.boards {
-        board.slots = sanitize_slots(std::mem::take(&mut board.slots));
-    }
+
     if state.boards.is_empty() {
         warn!("State has no boards; creating a fresh one.");
         state.boards.push(Board::empty(1, "My Sounds"));
     }
+
+    // Deduplicate board IDs (L1)
+    let mut seen_board_ids = HashSet::new();
+    let mut max_board_id: BoardId = state.boards.iter().map(|b| b.id).max().unwrap_or(0);
+    for board in &mut state.boards {
+        if !seen_board_ids.insert(board.id) || board.id == 0 {
+            max_board_id = max_board_id.saturating_add(1);
+            warn!(
+                "Duplicate or zero board id {}; reassigning to {max_board_id}.",
+                board.id
+            );
+            board.id = max_board_id;
+            seen_board_ids.insert(max_board_id);
+        }
+    }
+
+    // Deduplicate slot IDs across all boards (L1)
+    let mut seen_slot_ids = HashSet::new();
+    let mut max_slot_id: SlotId = state
+        .boards
+        .iter()
+        .flat_map(|b| b.slots.iter().map(|s| s.id))
+        .max()
+        .unwrap_or(0);
+
+    for board in &mut state.boards {
+        board.slots = sanitize_slots(std::mem::take(&mut board.slots));
+        for slot in &mut board.slots {
+            if !seen_slot_ids.insert(slot.id) || slot.id == 0 {
+                max_slot_id = max_slot_id.saturating_add(1);
+                warn!(
+                    "Duplicate or zero slot id {} on {:?}; reassigning to {max_slot_id}.",
+                    slot.id, slot.name
+                );
+                slot.id = max_slot_id;
+                seen_slot_ids.insert(max_slot_id);
+            }
+        }
+    }
+
     if !state.boards.iter().any(|b| b.id == state.active_board) {
         state.active_board = state.boards[0].id;
     }
@@ -262,6 +373,26 @@ fn sanitize_slots(slots: Vec<SoundSlot>) -> Vec<SoundSlot> {
                 path.display()
             );
         }
+
+        // M8: Validate trim fractions and duration
+        if !slot.trim_start.is_finite() || slot.trim_start < 0.0 {
+            slot.trim_start = 0.0;
+        }
+        if !slot.trim_end.is_finite() || slot.trim_end > 1.0 {
+            slot.trim_end = 1.0;
+        }
+        if slot.trim_start > slot.trim_end {
+            slot.trim_start = 0.0;
+            slot.trim_end = 1.0;
+        }
+        if let Some(dur) = slot.duration_secs {
+            if !dur.is_finite() || dur <= 0.0 || dur > 86_400.0 {
+                slot.duration_secs = None;
+                slot.trim_start = 0.0;
+                slot.trim_end = 1.0;
+            }
+        }
+
         clean.push(slot);
     }
 
@@ -286,12 +417,11 @@ pub fn next_slot_id(boards: &[Board]) -> SlotId {
         .iter()
         .flat_map(|b| b.slots.iter().map(|s| s.id))
         .max()
-        .unwrap_or(0)
-        + 1
+        .map_or(1, |max| max.saturating_add(1))
 }
 
 pub fn next_board_id(boards: &[Board]) -> crate::model::BoardId {
-    boards.iter().map(|b| b.id).max().unwrap_or(0) + 1
+    boards.iter().map(|b| b.id).max().map_or(1, |max| max.saturating_add(1))
 }
 
 #[cfg(test)]
@@ -539,5 +669,54 @@ mod tests {
         ];
         assert_eq!(next_slot_id(&boards), 10);
         assert_eq!(next_board_id(&boards), 6);
+    }
+
+    #[test]
+    fn duplicate_ids_are_deduplicated() {
+        let state = AppState {
+            boards: vec![
+                Board {
+                    id: 1,
+                    name: "Board 1".to_owned(),
+                    slots: vec![
+                        slot(5, "A", None, Some("/a.mp3")),
+                        slot(5, "B", None, Some("/b.mp3")),
+                    ],
+                },
+                Board {
+                    id: 1,
+                    name: "Board 2".to_owned(),
+                    slots: vec![
+                        slot(5, "C", None, Some("/c.mp3")),
+                        slot(0, "D", None, Some("/d.mp3")),
+                    ],
+                },
+            ],
+            ..AppState::default()
+        };
+        let clean = sanitize_state(state);
+        assert_eq!(clean.boards.len(), 2);
+        assert_ne!(clean.boards[0].id, clean.boards[1].id);
+
+        let mut slot_ids = HashSet::new();
+        for b in &clean.boards {
+            for s in &b.slots {
+                assert!(s.id > 0);
+                assert!(slot_ids.insert(s.id), "slot id {} must be unique", s.id);
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_floats_and_trims_are_sanitized() {
+        let mut s = slot(1, "Corrupt", None, Some("/a.mp3"));
+        s.trim_start = f32::NAN;
+        s.trim_end = 2.5;
+        s.duration_secs = Some(f32::INFINITY);
+
+        let cleaned = sanitize_slots(vec![s]);
+        assert_eq!(cleaned[0].trim_start, 0.0);
+        assert_eq!(cleaned[0].trim_end, 1.0);
+        assert_eq!(cleaned[0].duration_secs, None);
     }
 }
