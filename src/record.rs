@@ -34,14 +34,40 @@ fn death_reason(reason: &DeathReason) -> Option<String> {
     reason.lock().ok().and_then(|guard| guard.clone())
 }
 
+#[derive(Clone, Debug)]
+pub struct RecordAttempt {
+    pub id: u64,
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecordAttempt {
+    pub fn new(id: u64) -> Self {
+        Self {
+            id,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 #[derive(Debug)]
 pub enum RecordCommand {
-    Start(Option<String>),
+    Start {
+        device: Option<String>,
+        attempt: RecordAttempt,
+    },
     Stop,
 }
 
 #[derive(Debug)]
 pub enum RecordEvent {
+    Cancelled,
     Started {
         device: String,
     },
@@ -63,9 +89,15 @@ pub enum RecordEvent {
     Failed(String),
 }
 
-pub fn spawn_recorder(ctx: egui::Context) -> (Sender<RecordCommand>, Receiver<RecordEvent>) {
+#[derive(Debug)]
+pub struct RecordMessage {
+    pub attempt_id: u64,
+    pub event: RecordEvent,
+}
+
+pub fn spawn_recorder(ctx: egui::Context) -> (Sender<RecordCommand>, Receiver<RecordMessage>) {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<RecordCommand>();
-    let (event_tx, event_rx) = crossbeam_channel::unbounded::<RecordEvent>();
+    let (event_tx, event_rx) = crossbeam_channel::unbounded::<RecordMessage>();
 
     std::thread::Builder::new()
         .name("mic-recorder".to_owned())
@@ -153,12 +185,29 @@ fn write_chunk<W: std::io::Write + std::io::Seek>(
 
 fn run_recorder(
     cmd_rx: Receiver<RecordCommand>,
-    event_tx: Sender<RecordEvent>,
+    event_tx: Sender<RecordMessage>,
     ctx: egui::Context,
+) {
+    run_recorder_with(cmd_rx, event_tx, ctx, record_once);
+}
+
+fn run_recorder_with(
+    cmd_rx: Receiver<RecordCommand>,
+    event_tx: Sender<RecordMessage>,
+    ctx: egui::Context,
+    mut record: impl FnMut(
+        &Receiver<RecordCommand>,
+        &Sender<RecordMessage>,
+        &egui::Context,
+        Option<String>,
+        &RecordAttempt,
+    ),
 ) {
     loop {
         match cmd_rx.recv() {
-            Ok(RecordCommand::Start(device)) => record_once(&cmd_rx, &event_tx, &ctx, device),
+            Ok(RecordCommand::Start { device, attempt }) => {
+                record(&cmd_rx, &event_tx, &ctx, device, &attempt)
+            }
             Ok(RecordCommand::Stop) => {}
             Err(_) => {
                 info!("UI hung up; recorder shutting down.");
@@ -170,22 +219,51 @@ fn run_recorder(
 
 fn record_once(
     cmd_rx: &Receiver<RecordCommand>,
-    event_tx: &Sender<RecordEvent>,
+    event_tx: &Sender<RecordMessage>,
     ctx: &egui::Context,
     wanted: Option<String>,
+    attempt: &RecordAttempt,
 ) {
     let emit = |event: RecordEvent| {
+        // Cancellation racing with Started is not terminal until stream/file cleanup.
+        if attempt.is_cancelled() && matches!(event, RecordEvent::Started { .. }) {
+            return;
+        }
+        let event = if attempt.is_cancelled() {
+            if let RecordEvent::Saved { path, .. } = &event {
+                let _ = std::fs::remove_file(path);
+            }
+            RecordEvent::Cancelled
+        } else {
+            event
+        };
         if let RecordEvent::Failed(message) = &event {
             warn!("Recording failed: {message}");
         }
-        if event_tx.send(event).is_err() {
+        if event_tx
+            .send(RecordMessage {
+                attempt_id: attempt.id,
+                event,
+            })
+            .is_err()
+        {
             warn!("UI is gone; record event dropped.");
         } else {
             ctx.request_repaint();
         }
     };
 
+    macro_rules! cancelled {
+        () => {
+            if attempt.is_cancelled() {
+                emit(RecordEvent::Cancelled);
+                return;
+            }
+        };
+    }
+    cancelled!();
     let host = cpal::default_host();
+    cancelled!();
     let (device, fallback_note) = match wanted.as_deref() {
         Some(name) => match crate::devices::find_input_device_by_name(name) {
             Some(device) => (Some(device), String::new()),
@@ -199,6 +277,7 @@ fn record_once(
         },
         None => (host.default_input_device(), String::new()),
     };
+    cancelled!();
     let device = match device {
         Some(device) => device,
         None => {
@@ -211,6 +290,7 @@ fn record_once(
     let device_name =
         crate::devices::device_display_name(&device).unwrap_or_else(|| "microphone".to_owned());
 
+    cancelled!();
     info!("Opening microphone {device_name}.");
     let config = match device.default_input_config() {
         Ok(config) => config,
@@ -222,6 +302,7 @@ fn record_once(
             return;
         }
     };
+    cancelled!();
     let channels = config.channels();
     let sample_rate = config.sample_rate();
     info!("Recording from {device_name} ({channels}ch, {sample_rate}Hz).");
@@ -292,12 +373,14 @@ fn record_once(
             return;
         }
     };
+    cancelled!();
     if let Err(err) = stream.play() {
         emit(RecordEvent::Failed(format!(
             "Could not start recording: {err}."
         )));
         return;
     }
+    cancelled!();
     info!("Mic stream started ({device_name}).");
 
     if let Some(reason) = death_reason(&died) {
@@ -316,6 +399,7 @@ fn record_once(
             return;
         }
     };
+    cancelled!();
     if let Err(err) = std::fs::create_dir_all(&dir) {
         drop(stream);
         emit(RecordEvent::Failed(format!(
@@ -323,6 +407,7 @@ fn record_once(
         )));
         return;
     }
+    cancelled!();
     let path = dir.join(stamp_name());
     let spec = hound::WavSpec {
         channels,
@@ -341,6 +426,13 @@ fn record_once(
         }
     };
 
+    if attempt.is_cancelled() {
+        drop(stream);
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        emit(RecordEvent::Cancelled);
+        return;
+    }
     emit(RecordEvent::Started {
         device: device_name.clone(),
     });
@@ -361,10 +453,13 @@ fn record_once(
                 ui_gone = true;
                 break;
             }
-            Ok(RecordCommand::Start(_)) => {}
+            Ok(RecordCommand::Start { .. }) => {}
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
         }
 
+        if attempt.is_cancelled() {
+            break;
+        }
         if death_reason(&died).is_some() {
             break;
         }
@@ -409,6 +504,12 @@ fn record_once(
 
     drop(stream);
 
+    if attempt.is_cancelled() {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        emit(RecordEvent::Cancelled);
+        return;
+    }
     if ui_gone {
         drop(writer);
         let _ = std::fs::remove_file(&path);
@@ -472,6 +573,66 @@ fn record_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_open_returns_cancellation_then_same_worker_accepts_retry() {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            run_recorder_with(
+                cmd_rx,
+                event_tx,
+                egui::Context::default(),
+                |_, tx, _, _, attempt| {
+                    entered_tx.send(attempt.id).unwrap();
+                    release_rx.recv().unwrap();
+                    let event = if attempt.is_cancelled() {
+                        RecordEvent::Cancelled
+                    } else {
+                        RecordEvent::Failed("fake attempt finished".into())
+                    };
+                    tx.send(RecordMessage {
+                        attempt_id: attempt.id,
+                        event,
+                    })
+                    .unwrap();
+                },
+            );
+        });
+        let attempt = RecordAttempt::new(1);
+        cmd_tx
+            .send(RecordCommand::Start {
+                device: None,
+                attempt: attempt.clone(),
+            })
+            .unwrap();
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        for _ in 0..10 {
+            attempt.cancel();
+        }
+        assert!(event_rx.is_empty());
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(2)).unwrap().event,
+            RecordEvent::Cancelled
+        ));
+        cmd_tx
+            .send(RecordCommand::Start {
+                device: None,
+                attempt: RecordAttempt::new(2),
+            })
+            .unwrap();
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(2)).unwrap().event,
+            RecordEvent::Failed(_)
+        ));
+        drop(cmd_tx);
+        worker.join().unwrap();
+    }
 
     fn sine_samples(secs: f32, rate: u32) -> Vec<f32> {
         let n = (secs * rate as f32) as usize;
@@ -575,9 +736,16 @@ mod tests {
             return;
         }
         let (cmd_tx, event_rx) = spawn_recorder(egui::Context::default());
-        cmd_tx.send(RecordCommand::Start(None)).unwrap();
+        cmd_tx
+            .send(RecordCommand::Start {
+                device: None,
+                attempt: RecordAttempt::new(1),
+            })
+            .unwrap();
 
-        let started = event_rx.recv_timeout(Duration::from_secs(10));
+        let started = event_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map(|m| m.event);
         match started {
             Err(_) => {
                 eprintln!("SKIP: mic did not start in time");
@@ -591,7 +759,10 @@ mod tests {
         }
         std::thread::sleep(Duration::from_secs(1));
         cmd_tx.send(RecordCommand::Stop).unwrap();
-        match event_rx.recv_timeout(Duration::from_secs(10)) {
+        match event_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map(|m| m.event)
+        {
             Ok(RecordEvent::Saved {
                 path,
                 duration_secs,

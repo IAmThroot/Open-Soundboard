@@ -1,5 +1,19 @@
 # Changelog
 
+## [v0.1.3] — 2026-10-31
+
+### Bug fixes
+- **Audio recovery:** stream errors now invalidate the failed output and finish its players. Play, Test Sound, or device refresh retries the requested output; stale errors from replaced streams are ignored.
+- **Routing:** fallback output is reported without overwriting the requested device preference.
+- **Hotkeys:** output-device failures no longer mark valid audio files broken or disable their bindings. Hotkeys remain suspended throughout key capture, including asynchronous rebuilds.
+- **Playback state:** a failed retrigger stops the previous player so tile indicators and Stop controls remain accurate.
+- **Recording:** microphone attempts carry IDs and cancellation tokens. A startup timeout retains one worker, disables retries until it returns, and discards cancelled takes. Restart the app if the driver never returns. Stale events and recorder disconnections are handled explicitly.
+- **Waveforms:** enforce the 16-result cache limit on completion and cap outstanding work at 16. Invalidated requests cannot overwrite newer results; an editor waiting for capacity retries after completion.
+- **Release:** validate tag/package version agreement and run tests, formatting, and lint before packaging.
+
+### Validation
+- Added hardware-independent regression tests for device failures, playback state, microphone cancellation, waveform limits, and hotkey capture.
+
 ## [v0.1.2] — 2026-10-20
 
 ### Bug fixes
@@ -41,3 +55,5 @@
 
 [v0.1.2]: https://github.com/IAmThroot/Open-Soundboard/releases/tag/v0.1.2
 [v0.1.1]: https://github.com/IAmThroot/Open-Soundboard/releases/tag/v0.1.1
+
+[v0.1.3]: https://github.com/IAmThroot/Open-Soundboard/releases/tag/v0.1.3

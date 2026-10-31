@@ -16,7 +16,7 @@ use crate::hotkey::{
     spawn_hotkey_thread, to_global_hotkeys, HotkeyBinding, HotkeyCommand, HotkeyEvent, STOP_ALL_ID,
 };
 use crate::model::{Board, BoardId, Hotkey, SlotId, SoundSlot};
-use crate::record::{spawn_recorder, RecordCommand, RecordEvent};
+use crate::record::{spawn_recorder, RecordAttempt, RecordCommand, RecordEvent, RecordMessage};
 use crate::theme;
 use crate::tray::{Tray, TrayAction};
 use crate::waveform::{build_waveform, Waveform};
@@ -88,11 +88,13 @@ pub struct SoundboardApp {
     hotkey_state: HotkeyBackendState,
 
     record_tx: Sender<RecordCommand>,
-    record_rx: Receiver<RecordEvent>,
+    record_rx: Receiver<RecordMessage>,
 
     mic: Option<MicTake>,
 
     mic_starting: Option<Instant>,
+    mic_attempt: Option<RecordAttempt>,
+    next_mic_attempt: u64,
 
     /// Board that was active when the user pressed Record; the finished take
     /// is added there even if they switch boards while recording.
@@ -168,56 +170,104 @@ enum EditorHandle {
     End,
 }
 
+struct WaveRequest {
+    id: SlotId,
+    path: PathBuf,
+    token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct WaveResult {
+    request: WaveRequest,
+    result: Result<Waveform, String>,
+}
+
 struct WaveCache {
     ready: HashMap<SlotId, Result<Waveform, String>>,
     order: Vec<SlotId>,
-    pending: HashSet<SlotId>,
-    req_tx: crossbeam_channel::Sender<(SlotId, PathBuf)>,
-    res_rx: crossbeam_channel::Receiver<(SlotId, PathBuf, Result<Waveform, String>)>,
+    pending: HashMap<SlotId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    outstanding: usize,
+    req_tx: Sender<WaveRequest>,
+    res_rx: Receiver<WaveResult>,
 }
 
 const MAX_CACHED_WAVEFORMS: usize = 16;
 
 impl WaveCache {
     fn new(ctx: &egui::Context) -> Self {
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<(SlotId, PathBuf)>();
+        let (req_tx, req_rx) = crossbeam_channel::bounded::<WaveRequest>(MAX_CACHED_WAVEFORMS);
         let (res_tx, res_rx) = crossbeam_channel::unbounded();
         let ctx = ctx.clone();
-
         std::thread::Builder::new()
             .name("waveform-worker".to_owned())
             .spawn(move || {
-                while let Ok((id, path)) = req_rx.recv() {
-                    let result = match std::panic::catch_unwind(|| build_waveform(&path)) {
-                        Ok(r) => r,
-                        Err(_) => Err("Waveform decoder thread panicked".to_string()),
+                while let Ok(request) = req_rx.recv() {
+                    let result = if request.token.load(std::sync::atomic::Ordering::Acquire) {
+                        Err("Cancelled".to_owned())
+                    } else {
+                        match std::panic::catch_unwind(|| build_waveform(&request.path)) {
+                            Ok(r) => r,
+                            Err(_) => Err("Waveform decoder thread panicked".to_string()),
+                        }
                     };
-                    let _ = res_tx.send((id, path, result));
+                    if res_tx.send(WaveResult { request, result }).is_err() {
+                        break;
+                    }
                     ctx.request_repaint();
                 }
             })
             .expect("failed to spawn waveform worker thread");
-
         Self {
             ready: HashMap::new(),
             order: Vec::new(),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
+            outstanding: 0,
             req_tx,
             res_rx,
         }
     }
 
     fn request(&mut self, id: SlotId, path: PathBuf) {
-        if self.ready.contains_key(&id) || !self.pending.insert(id) {
+        if self.ready.contains_key(&id)
+            || self.pending.contains_key(&id)
+            || self.outstanding >= MAX_CACHED_WAVEFORMS
+        {
             return;
         }
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if self
+            .req_tx
+            .try_send(WaveRequest {
+                id,
+                path,
+                token: token.clone(),
+            })
+            .is_ok()
+        {
+            self.pending.insert(id, token);
+            self.outstanding += 1;
+        }
+    }
 
+    fn complete(&mut self, request: &WaveRequest) -> bool {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        let current = self
+            .pending
+            .get(&request.id)
+            .is_some_and(|token| std::sync::Arc::ptr_eq(token, &request.token));
+        if current {
+            self.pending.remove(&request.id);
+        }
+        current && !request.token.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn insert(&mut self, id: SlotId, result: Result<Waveform, String>) {
+        self.order.retain(|&x| x != id);
         while self.order.len() >= MAX_CACHED_WAVEFORMS {
             let evict = self.order.remove(0);
             self.ready.remove(&evict);
         }
-
-        let _ = self.req_tx.send((id, path));
+        self.ready.insert(id, result);
+        self.order.push(id);
     }
 
     fn touch(&mut self, id: SlotId) {
@@ -230,7 +280,9 @@ impl WaveCache {
     fn invalidate(&mut self, id: SlotId) {
         self.ready.remove(&id);
         self.order.retain(|&x| x != id);
-        self.pending.remove(&id);
+        if let Some(token) = self.pending.remove(&id) {
+            token.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -350,6 +402,8 @@ impl SoundboardApp {
             record_rx,
             mic: None,
             mic_starting: None,
+            mic_attempt: None,
+            next_mic_attempt: 1,
             mic_start_board: None,
             mic_devices,
             mic_device,
@@ -574,6 +628,10 @@ impl SoundboardApp {
     }
 
     fn push_hotkey_rebuild(&mut self) {
+        if self.recording.is_some() {
+            self.suspend_hotkey_grabs();
+            return;
+        }
         self.rejected_hotkeys.clear();
         let mut bindings: Vec<HotkeyBinding> = self
             .active()
@@ -869,11 +927,13 @@ impl SoundboardApp {
                         self.output_devices = list_output_devices();
 
                         if !self.output_devices.contains(&self.output_device) {
-                            self.output_device = SYSTEM_DEFAULT_LABEL.to_owned();
-                            self.send(AudioCommand::SetDevice(self.output_device.clone()));
-                            self.mark_dirty();
+                            self.output_devices.insert(1, self.output_device.clone());
                         }
-                        self.toast(ToastKind::Info, "Device list refreshed.");
+                        self.send(AudioCommand::RefreshDevice);
+                        self.toast(
+                            ToastKind::Info,
+                            "Device list refreshed; reopening selected output.",
+                        );
                     }
 
                     let test_label = if self.testing {
@@ -1076,7 +1136,7 @@ impl SoundboardApp {
                                 ui.add_sized(
                                     [90.0, 26.0],
                                     egui::Button::new(
-                                        RichText::new("● Starting…").size(12.5).color(theme::MUTED),
+                                        RichText::new(if self.mic_attempt.as_ref().is_some_and(|a| a.is_cancelled()) { "Waiting for driver…" } else { "● Starting…" }).size(12.5).color(theme::MUTED),
                                     )
                                     .fill(theme::BG_SOFT)
                                     .corner_radius(CornerRadius::same(8)),
@@ -1099,7 +1159,15 @@ impl SoundboardApp {
                                 .then(|| self.mic_device.clone());
                             self.mic_starting = Some(Instant::now());
                             self.mic_start_board = Some(self.active_board);
-                            let _ = self.record_tx.send(RecordCommand::Start(device));
+                            let attempt = RecordAttempt::new(self.next_mic_attempt);
+                            self.next_mic_attempt = self.next_mic_attempt.wrapping_add(1);
+                            self.mic_attempt = Some(attempt.clone());
+                            if self.record_tx.send(RecordCommand::Start { device, attempt }).is_err() {
+                                self.mic_attempt = None;
+                                self.mic_starting = None;
+                                self.mic_start_board = None;
+                                self.toast(ToastKind::Warn, "The recorder stopped unexpectedly. Restart the app to record again.");
+                            }
                         }
                     }
 
@@ -1636,13 +1704,24 @@ impl SoundboardApp {
                 AudioEvent::DeviceReady { actual, fallback } => {
                     if let Some(note) = fallback {
                         if !actual.is_empty() {
-                            self.output_device = actual;
+                            // Preserve the requested routing preference.
+                            log::info!("Actual fallback output: {actual}");
                         }
                         self.playing.clear();
                         self.preview_playing = false;
                         self.testing = false;
                         self.toast(ToastKind::Warn, note);
                     }
+                }
+                AudioEvent::DeviceUnavailable { id, message } => {
+                    self.playing.remove(&id);
+                    if id == TEST_SOUND_ID {
+                        self.testing = false;
+                    }
+                    if id == PREVIEW_TRIM_ID {
+                        self.preview_playing = false;
+                    }
+                    self.toast(ToastKind::Warn, message);
                 }
                 AudioEvent::StreamError(message) => {
                     self.playing.clear();
@@ -1784,9 +1863,49 @@ impl SoundboardApp {
         }
     }
 
+    fn check_mic_timeout(&mut self) {
+        if let Some(since) = self.mic_starting {
+            if since.elapsed() > MIC_START_TIMEOUT {
+                if let Some(attempt) = &self.mic_attempt {
+                    if !attempt.is_cancelled() {
+                        attempt.cancel();
+                        self.toast(ToastKind::Warn,
+                            "Microphone is still opening; waiting for the driver. Restart the app if it never returns.");
+                    }
+                }
+            }
+        }
+    }
+
     fn poll_record_events(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(event) = self.record_rx.try_recv() {
+        let disconnected = loop {
+            let RecordMessage { attempt_id, event } = match self.record_rx.try_recv() {
+                Ok(message) => message,
+                Err(crossbeam_channel::TryRecvError::Empty) => break false,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break true,
+            };
+            if !self
+                .mic_attempt
+                .as_ref()
+                .is_some_and(|a| a.id == attempt_id)
+            {
+                continue;
+            }
+            let event = if self.mic_attempt.as_ref().is_some_and(|a| a.is_cancelled()) {
+                if matches!(event, RecordEvent::Started { .. }) {
+                    continue;
+                }
+                if let RecordEvent::Saved { path, .. } = &event {
+                    let _ = std::fs::remove_file(path);
+                }
+                RecordEvent::Cancelled
+            } else {
+                event
+            };
+            if !matches!(event, RecordEvent::Started { .. }) {
+                self.mic_attempt = None;
+            }
             changed = true;
 
             self.mic_starting = None;
@@ -1865,12 +1984,31 @@ impl SoundboardApp {
                         );
                     }
                 }
+                RecordEvent::Cancelled => {
+                    self.mic = None;
+                    self.mic_start_board = None;
+                    self.toast(
+                        ToastKind::Info,
+                        "Microphone attempt cancelled. You can try again.",
+                    );
+                }
                 RecordEvent::Failed(message) => {
                     self.mic = None;
                     self.mic_start_board = None;
                     self.toast(ToastKind::Warn, message);
                 }
             }
+        };
+        if self.mic_attempt.is_some() && disconnected {
+            self.mic_attempt = None;
+            self.mic_starting = None;
+            self.mic_start_board = None;
+            self.mic = None;
+            self.toast(
+                ToastKind::Warn,
+                "The recorder stopped unexpectedly. Restart the app to record again.",
+            );
+            changed = true;
         }
         changed
     }
@@ -1976,19 +2114,18 @@ impl SoundboardApp {
 
     fn poll_waves(&mut self) -> bool {
         let mut changed = false;
-        while let Ok((id, path, result)) = self.waves.res_rx.try_recv() {
+        while let Ok(WaveResult { request, result }) = self.waves.res_rx.try_recv() {
+            let valid = self.waves.complete(&request);
+            let WaveRequest { id, path, .. } = request;
             changed = true;
-            self.waves.pending.remove(&id);
             let current = self
                 .boards
                 .iter()
                 .flat_map(|b| b.slots.iter())
                 .find(|s| s.id == id)
                 .and_then(|s| s.file_path.clone());
-            if current.as_ref() == Some(&path) {
-                self.waves.order.retain(|&x| x != id);
-                self.waves.order.push(id);
-                self.waves.ready.insert(id, result);
+            if valid && current.as_ref() == Some(&path) {
+                self.waves.insert(id, result);
             }
         }
         changed
@@ -2306,7 +2443,10 @@ impl SoundboardApp {
             }
         }
 
-        if let Some(since) = self.mic_starting {
+        if let Some(since) = self
+            .mic_starting
+            .filter(|_| !self.mic_attempt.as_ref().is_some_and(|a| a.is_cancelled()))
+        {
             let remaining = MIC_START_TIMEOUT.saturating_sub(since.elapsed());
             ctx.request_repaint_after(remaining);
         }
@@ -2348,26 +2488,22 @@ impl eframe::App for SoundboardApp {
         if self.poll_waves() {
             ctx.request_repaint();
         }
+        if let Some(id) = self.editor.as_ref().map(|e| e.slot) {
+            if let Some(path) = self
+                .boards
+                .iter()
+                .flat_map(|b| &b.slots)
+                .find(|s| s.id == id)
+                .and_then(|s| s.file_path.clone())
+            {
+                self.waves.request(id, path);
+            }
+        }
         if self.poll_record_events() {
             ctx.request_repaint();
         }
 
-        if let Some(since) = self.mic_starting {
-            if since.elapsed() > MIC_START_TIMEOUT {
-                log::warn!("Mic start timed out; restarting the recorder thread.");
-                let (tx, rx) = spawn_recorder(self.ctx.clone());
-                self.record_tx = tx;
-                self.record_rx = rx;
-                self.mic_starting = None;
-                self.mic_start_board = None;
-                self.toast(
-                    ToastKind::Warn,
-                    "The microphone took too long to open — it may be in use by another app. \
-                     Try again, or pick a different microphone.",
-                );
-                ctx.request_repaint();
-            }
-        }
+        self.check_mic_timeout();
 
         self.handle_tray(ctx);
 
@@ -2744,6 +2880,277 @@ fn ellipsize(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app() -> SoundboardApp {
+        let ctx = egui::Context::default();
+        let boards = vec![Board::empty(1, "Test")];
+        let active_board = 1;
+        let output_devices = vec![];
+        let output_device = SYSTEM_DEFAULT_LABEL.to_owned();
+        let volume = 0.7;
+        let (audio_tx, audio_rx) = crossbeam_channel::unbounded();
+        // The fixture does not run audio, hotkey, recorder, or persistence workers.
+        let audio_rx = {
+            drop(audio_rx);
+            crossbeam_channel::unbounded().1
+        };
+        let (hotkey_tx, _) = crossbeam_channel::unbounded();
+        let (_, hotkey_rx) = crossbeam_channel::unbounded();
+        let (record_tx, _) = crossbeam_channel::unbounded();
+        let (_, record_rx) = crossbeam_channel::unbounded();
+        let (save_tx, _) = crossbeam_channel::unbounded();
+        let (_, save_rx) = crossbeam_channel::unbounded();
+        let mic_devices = vec![];
+        let mic_device = SYSTEM_DEFAULT_LABEL.to_owned();
+        let stop_hotkey = None;
+        let save_error = None;
+        let read_only = false;
+        let close_to_tray = false;
+        let next_slot_id = 1;
+        SoundboardApp {
+            ctx: ctx.clone(),
+            boards,
+            active_board,
+            output_devices,
+            output_device,
+            volume,
+            audio_tx,
+            audio_rx,
+            hotkey_tx,
+            hotkey_rx,
+            hotkey_state: HotkeyBackendState::Starting,
+            record_tx,
+            record_rx,
+            mic: None,
+            mic_starting: None,
+            mic_attempt: None,
+            next_mic_attempt: 1,
+            mic_start_board: None,
+            mic_devices,
+            mic_device,
+            stop_hotkey,
+            config_dirty: false,
+            last_save: Instant::now(),
+            save_backoff: Duration::from_millis(700),
+            save_error,
+            read_only,
+            save_tx,
+            save_rx,
+            save_in_flight: false,
+            edit_generation: 0,
+            broken: HashSet::new(),
+            next_slot_id,
+            recording: None,
+            playing: HashSet::new(),
+            preview_playing: false,
+            testing: false,
+            confirm: None,
+            toast: None,
+            board_dialog: None,
+            editor: None,
+            waves: WaveCache::new(&ctx),
+            rejected_hotkeys: HashSet::new(),
+            notified_rejected_hotkeys: HashSet::new(),
+            tray: None,
+            close_to_tray,
+            settings_open: false,
+            quit_requested: false,
+            window_visible: true,
+        }
+    }
+
+    #[test]
+    fn timeout_cancels_once_without_replacing_worker_or_enabling_retry() {
+        let mut app = test_app();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        app.record_tx = tx.clone();
+        app.mic_attempt = Some(RecordAttempt::new(3));
+        app.mic_starting = Some(Instant::now() - MIC_START_TIMEOUT - Duration::from_secs(1));
+        for _ in 0..10 {
+            app.check_mic_timeout();
+        }
+        assert!(app.record_tx.same_channel(&tx));
+        assert!(app.mic_attempt.as_ref().unwrap().is_cancelled());
+        assert!(app.mic_starting.is_some());
+        assert_eq!(app.next_mic_attempt, 1);
+    }
+
+    #[test]
+    fn waveform_outstanding_limit_includes_invalidated_requests_and_editor_retry() {
+        let (req_tx, req_rx) = crossbeam_channel::bounded(MAX_CACHED_WAVEFORMS);
+        let (_, res_rx) = crossbeam_channel::unbounded();
+        let mut cache = WaveCache {
+            ready: HashMap::new(),
+            order: vec![],
+            pending: HashMap::new(),
+            outstanding: 0,
+            req_tx,
+            res_rx,
+        };
+        for id in 0..32 {
+            cache.request(id, "/test.wav".into());
+        }
+        assert_eq!(cache.outstanding, 16);
+        cache.invalidate(0);
+        cache.request(99, "/editor.wav".into());
+        assert!(!cache.pending.contains_key(&99));
+        assert!(!cache.complete(&req_rx.try_recv().unwrap()));
+        cache.request(99, "/editor.wav".into());
+        assert!(cache.pending.contains_key(&99));
+        assert_eq!(cache.outstanding, 16);
+        assert_eq!(req_rx.len(), 16);
+    }
+
+    #[test]
+    fn fallback_does_not_replace_saved_output_preference() {
+        let mut app = test_app();
+        app.output_device = "Requested cable".into();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.audio_rx = rx;
+        tx.send(AudioEvent::DeviceReady {
+            actual: "Speakers".into(),
+            fallback: Some("Using speakers".into()),
+        })
+        .unwrap();
+        app.poll_audio_events();
+        assert_eq!(
+            app.snapshot_state().output_device_name.as_deref(),
+            Some("Requested cable")
+        );
+    }
+
+    #[test]
+    fn recorder_disconnect_clears_startup_state() {
+        let mut app = test_app();
+        app.mic_attempt = Some(RecordAttempt::new(1));
+        app.mic_starting = Some(Instant::now());
+        assert!(app.poll_record_events());
+        assert!(app.mic_attempt.is_none());
+        assert!(app.mic_starting.is_none());
+    }
+
+    #[test]
+    fn cancelled_saved_event_discards_take_instead_of_adding_slot() {
+        let mut app = test_app();
+        let attempt = RecordAttempt::new(3);
+        attempt.cancel();
+        app.mic_attempt = Some(attempt);
+        let path = std::env::temp_dir().join(format!("cancelled-take-{}.wav", std::process::id()));
+        std::fs::write(&path, b"cancelled take").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.record_rx = rx;
+        tx.send(RecordMessage {
+            attempt_id: 3,
+            event: RecordEvent::Saved {
+                path: path.clone(),
+                duration_secs: 1.0,
+                capped: false,
+                dropped_chunks: 0,
+                stream_died: false,
+            },
+        })
+        .unwrap();
+        app.poll_record_events();
+        assert!(!path.exists());
+        assert!(app.boards[0].slots.is_empty());
+        assert!(app.mic_attempt.is_none());
+    }
+
+    #[test]
+    fn device_errors_preserve_bindings_but_file_errors_disable_them() {
+        let mut app = test_app();
+        let mut slot = SoundSlot::with_file(7, "valid", "/valid.wav");
+        slot.hotkey = Some(Hotkey::simple("F7"));
+        app.boards[0].slots.push(slot);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.audio_rx = rx;
+        tx.send(AudioEvent::DeviceUnavailable {
+            id: 7,
+            message: "offline".into(),
+        })
+        .unwrap();
+        app.poll_audio_events();
+        assert!(!app.broken.contains(&7));
+        assert!(app.boards[0].slots[0].hotkey.is_some());
+        tx.send(AudioEvent::DecodeError {
+            id: 7,
+            message: "bad file".into(),
+        })
+        .unwrap();
+        app.poll_audio_events();
+        assert!(app.broken.contains(&7));
+    }
+
+    #[test]
+    fn rebuild_stays_suspended_during_capture() {
+        let mut app = test_app();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.hotkey_tx = tx;
+        app.stop_hotkey = Some(Hotkey::simple("F8"));
+        app.recording = Some(7);
+        app.push_hotkey_rebuild();
+        assert!(matches!(rx.try_recv(), Ok(HotkeyCommand::Rebuild(b)) if b.is_empty()));
+        app.recording = None;
+        app.push_hotkey_rebuild();
+        assert!(matches!(rx.try_recv(), Ok(HotkeyCommand::Rebuild(b)) if b.len() == 1));
+    }
+
+    #[test]
+    fn waveform_completion_enforces_capacity_and_rejects_stale_tokens() {
+        let mut cache = WaveCache::new(&egui::Context::default());
+        for id in 0..40 {
+            cache.insert(id, Err("test".into()));
+        }
+        assert_eq!(cache.ready.len(), MAX_CACHED_WAVEFORMS);
+        let old = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cache.pending.insert(99, old.clone());
+        cache.outstanding = 1;
+        cache.invalidate(99);
+        let new = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cache.pending.insert(99, new.clone());
+        cache.outstanding += 1;
+        assert!(!cache.complete(&WaveRequest {
+            id: 99,
+            path: "/old".into(),
+            token: old
+        }));
+        assert!(std::sync::Arc::ptr_eq(
+            cache.pending.get(&99).unwrap(),
+            &new
+        ));
+        assert_eq!(cache.outstanding, 1);
+    }
+
+    #[test]
+    fn cancelled_and_stale_recording_events_cannot_start_a_take() {
+        let mut app = test_app();
+        let attempt = RecordAttempt::new(2);
+        attempt.cancel();
+        app.mic_attempt = Some(attempt);
+        app.mic_starting = Some(Instant::now());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.record_rx = rx;
+        for attempt_id in [1, 2] {
+            tx.send(RecordMessage {
+                attempt_id,
+                event: RecordEvent::Started {
+                    device: "late".into(),
+                },
+            })
+            .unwrap();
+        }
+        app.poll_record_events();
+        assert!(app.mic.is_none());
+        assert!(app.mic_starting.is_some());
+        tx.send(RecordMessage {
+            attempt_id: 2,
+            event: RecordEvent::Cancelled,
+        })
+        .unwrap();
+        app.poll_record_events();
+        assert!(app.mic_attempt.is_none());
+        assert!(app.mic_starting.is_none());
+    }
 
     #[test]
     fn fmt_time_formats_minutes_seconds_and_tenths() {

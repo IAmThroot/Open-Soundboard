@@ -35,6 +35,7 @@ pub enum AudioCommand {
     StopAll,
 
     SetDevice(String),
+    RefreshDevice,
     SetVolume(f32),
 }
 
@@ -58,6 +59,10 @@ pub enum AudioEvent {
     },
 
     StreamError(String),
+    DeviceUnavailable {
+        id: SlotId,
+        message: String,
+    },
 }
 
 pub fn spawn_audio_engine(
@@ -78,7 +83,11 @@ pub fn spawn_audio_engine(
     (cmd_tx, event_rx)
 }
 
+type SinkOpener =
+    fn(&str, &Sender<(u64, String)>, u64, &egui::Context) -> Result<OpenedSink, String>;
+
 struct Engine {
+    open_sink: SinkOpener,
     cmd_rx: Receiver<AudioCommand>,
     event_tx: Sender<AudioEvent>,
     ctx: egui::Context,
@@ -89,6 +98,9 @@ struct Engine {
     players: HashMap<SlotId, Player>,
     current_device: String,
     volume: f32,
+    stream_generation: u64,
+    stream_tx: Sender<(u64, String)>,
+    stream_rx: Receiver<(u64, String)>,
 }
 
 fn run_engine(
@@ -98,10 +110,15 @@ fn run_engine(
     event_tx: Sender<AudioEvent>,
     ctx: egui::Context,
 ) {
+    let (stream_tx, stream_rx) = crossbeam_channel::unbounded();
     let mut engine = Engine {
+        open_sink: open_sink_for,
         cmd_rx,
         event_tx,
         ctx,
+        stream_generation: 0,
+        stream_tx,
+        stream_rx,
         sink: None,
         mixer: None,
         players: HashMap::new(),
@@ -112,6 +129,7 @@ fn run_engine(
     engine.open_device(&initial_device);
 
     loop {
+        engine.poll_stream_errors();
         match engine.cmd_rx.recv_timeout(POLL_INTERVAL) {
             Ok(cmd) => {
                 engine.handle(cmd);
@@ -138,14 +156,43 @@ impl Engine {
         }
     }
 
-    fn open_device(&mut self, requested: &str) {
-        let old_ids: Vec<SlotId> = self.players.keys().copied().collect();
+    fn poll_stream_errors(&mut self) {
+        while let Ok((generation, message)) = self.stream_rx.try_recv() {
+            if generation != self.stream_generation {
+                continue;
+            }
+            self.clear_output();
+            self.emit(AudioEvent::StreamError(message));
+        }
+    }
+
+    fn clear_output(&mut self) {
+        let ids: Vec<_> = self.players.keys().copied().collect();
         self.players.clear();
-        for id in old_ids {
+        self.mixer = None;
+        self.sink = None;
+        self.stream_generation = self.stream_generation.wrapping_add(1);
+        for id in ids {
             self.emit(AudioEvent::Finished(id));
         }
+    }
 
-        match open_sink_for(requested, &self.event_tx) {
+    fn ensure_output(&mut self) {
+        self.poll_stream_errors();
+        if self.sink.is_none() {
+            self.open_device(&self.current_device.clone());
+        }
+    }
+
+    fn open_device(&mut self, requested: &str) {
+        self.clear_output();
+        self.current_device = requested.to_owned();
+        match (self.open_sink)(
+            requested,
+            &self.stream_tx,
+            self.stream_generation,
+            &self.ctx,
+        ) {
             Ok(opened) => {
                 info!(
                     "Audio device open: requested={requested:?} actual={:?}",
@@ -196,6 +243,7 @@ impl Engine {
                 }
                 self.open_device(&name);
             }
+            AudioCommand::RefreshDevice => self.open_device(&self.current_device.clone()),
             AudioCommand::SetVolume(volume) => {
                 self.volume = volume.clamp(0.0, 1.0);
                 for player in self.players.values() {
@@ -206,6 +254,9 @@ impl Engine {
     }
 
     fn play_file(&mut self, id: SlotId, path: PathBuf, trim: Option<TrimSpec>) {
+        if self.players.remove(&id).is_some() {
+            self.emit(AudioEvent::Finished(id));
+        }
         debug!("Play requested: slot={id} path={}", path.display());
 
         let file = match File::open(&path) {
@@ -237,8 +288,9 @@ impl Engine {
             }
         };
 
+        self.ensure_output();
         let Some(mixer) = &self.mixer else {
-            self.emit(AudioEvent::DecodeError {
+            self.emit(AudioEvent::DeviceUnavailable {
                 id,
                 message: "No sound device is open. Pick another device above.".to_owned(),
             });
@@ -263,8 +315,9 @@ impl Engine {
     }
 
     fn play_test_tone(&mut self) {
+        self.ensure_output();
         let Some(mixer) = &self.mixer else {
-            self.emit(AudioEvent::DecodeError {
+            self.emit(AudioEvent::DeviceUnavailable {
                 id: TEST_SOUND_ID,
                 message: "No sound device is open. Pick another device above.".to_owned(),
             });
@@ -309,14 +362,19 @@ struct OpenedSink {
     fallback_note: Option<String>,
 }
 
-fn open_sink_for(requested: &str, event_tx: &Sender<AudioEvent>) -> Result<OpenedSink, String> {
+fn open_sink_for(
+    requested: &str,
+    stream_tx: &Sender<(u64, String)>,
+    generation: u64,
+    ctx: &egui::Context,
+) -> Result<OpenedSink, String> {
     if requested == SYSTEM_DEFAULT_LABEL {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .ok_or_else(|| "Windows reported no default sound device.".to_owned())?;
         let actual = device_display_name(&device).unwrap_or_else(|| "Default Device".to_owned());
-        let sink = open_stream(&device, event_tx)
+        let sink = open_stream(&device, stream_tx, generation, ctx)
             .map_err(|err| format!("Could not open the default sound device: {err}"))?;
         return Ok(OpenedSink {
             sink,
@@ -326,7 +384,7 @@ fn open_sink_for(requested: &str, event_tx: &Sender<AudioEvent>) -> Result<Opene
     }
 
     if let Some(device) = find_device_by_name(requested) {
-        let sink = open_stream(&device, event_tx)
+        let sink = open_stream(&device, stream_tx, generation, ctx)
             .map_err(|err| format!("Could not open {requested:?}: {err}"))?;
         return Ok(OpenedSink {
             sink,
@@ -340,7 +398,7 @@ fn open_sink_for(requested: &str, event_tx: &Sender<AudioEvent>) -> Result<Opene
         .default_output_device()
         .ok_or_else(|| format!("{requested:?} was not found, and there is no default device."))?;
     let actual = device_display_name(&device).unwrap_or_else(|| "Default Device".to_owned());
-    let sink = open_stream(&device, event_tx)
+    let sink = open_stream(&device, stream_tx, generation, ctx)
         .map_err(|err| format!("{requested:?} was not found; default device also failed: {err}"))?;
     Ok(OpenedSink {
         sink,
@@ -353,13 +411,18 @@ fn open_sink_for(requested: &str, event_tx: &Sender<AudioEvent>) -> Result<Opene
 
 fn open_stream(
     device: &cpal::Device,
-    event_tx: &Sender<AudioEvent>,
+    stream_tx: &Sender<(u64, String)>,
+    generation: u64,
+    ctx: &egui::Context,
 ) -> Result<MixerDeviceSink, String> {
-    let err_tx = event_tx.clone();
+    let err_tx = stream_tx.clone();
+    let ctx = ctx.clone();
     let callback = move |err: cpal::Error| {
-        let _ = err_tx.send(AudioEvent::StreamError(format!(
-            "The sound device reported a problem (it may have been unplugged): {err}"
-        )));
+        let _ = err_tx.send((
+            generation,
+            format!("The sound device reported a problem (it may have been unplugged): {err}"),
+        ));
+        ctx.request_repaint();
     };
 
     DeviceSinkBuilder::from_device(device.clone())
@@ -382,6 +445,80 @@ fn drain(rx: &Receiver<AudioEvent>) -> Vec<AudioEvent> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn fake_engine() -> (Engine, Receiver<AudioEvent>) {
+        let (_, cmd_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (stream_tx, stream_rx) = crossbeam_channel::unbounded();
+        (
+            Engine {
+                open_sink: |_, _, _, _| Err("fake unavailable output".into()),
+                cmd_rx,
+                event_tx,
+                ctx: egui::Context::default(),
+                sink: None,
+                mixer: None,
+                players: HashMap::new(),
+                current_device: "requested cable".into(),
+                volume: 0.5,
+                stream_generation: 1,
+                stream_tx,
+                stream_rx,
+            },
+            event_rx,
+        )
+    }
+
+    fn add_fake_player(engine: &mut Engine, id: SlotId) {
+        let (mixer, _source) =
+            rodio::mixer::mixer(2.try_into().unwrap(), 44100.try_into().unwrap());
+        engine.players.insert(id, Player::connect_new(&mixer));
+        engine.mixer = Some(mixer);
+    }
+
+    #[test]
+    fn stale_stream_error_does_not_stop_replacement() {
+        let (mut engine, rx) = fake_engine();
+        add_fake_player(&mut engine, 7);
+        engine.stream_tx.send((0, "old stream".into())).unwrap();
+        engine.poll_stream_errors();
+        assert!(engine.players.contains_key(&7));
+        assert!(rx.is_empty());
+        engine.stream_tx.send((1, "current stream".into())).unwrap();
+        engine.poll_stream_errors();
+        assert!(engine.players.is_empty());
+        assert!(engine.mixer.is_none());
+        assert!(matches!(rx.try_recv(), Ok(AudioEvent::Finished(7))));
+        assert!(matches!(rx.try_recv(), Ok(AudioEvent::StreamError(_))));
+    }
+
+    #[test]
+    fn failed_retrigger_finishes_old_player_before_file_error() {
+        let (mut engine, rx) = fake_engine();
+        add_fake_player(&mut engine, 7);
+        engine.play_file(7, PathBuf::from("/no-such-retrigger.wav"), None);
+        assert!(engine.players.is_empty());
+        assert!(matches!(rx.try_recv(), Ok(AudioEvent::Finished(7))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AudioEvent::FileMissing { id: 7, .. })
+        ));
+    }
+
+    #[test]
+    fn unavailable_device_retries_and_never_reports_decode_error() {
+        let (mut engine, rx) = fake_engine();
+        for _ in 0..2 {
+            engine.play_test_tone();
+            assert!(matches!(rx.try_recv(), Ok(AudioEvent::DeviceReady { .. })));
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(AudioEvent::DeviceUnavailable { .. })
+            ));
+        }
+        assert_eq!(engine.current_device, "requested cable");
+        assert_eq!(engine.stream_generation, 3);
+    }
 
     fn next_event(rx: &Receiver<AudioEvent>, timeout: Duration) -> Option<AudioEvent> {
         rx.recv_timeout(timeout).ok()
