@@ -2,6 +2,7 @@
 
 mod app;
 mod audio;
+mod board_bundle;
 mod config;
 mod devices;
 mod hotkey;

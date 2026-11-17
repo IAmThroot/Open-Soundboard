@@ -1,6 +1,6 @@
 name: Release
 
-# Tag a version (e.g. v0.1.3) to build the Windows installer and the portable zip
+# Tag a version (e.g. v0.1.4) to build the Windows installer and the portable zip
 # and attach them to a GitHub release. Also runnable manually (workflow_dispatch)
 # as a dry run: artifacts are uploaded, but no release is created.
 on:

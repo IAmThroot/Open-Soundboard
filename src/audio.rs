@@ -28,6 +28,7 @@ pub enum AudioCommand {
         id: SlotId,
         path: PathBuf,
         trim: Option<TrimSpec>,
+        volume: f32,
     },
 
     PlayTest,
@@ -37,6 +38,7 @@ pub enum AudioCommand {
     SetDevice(String),
     RefreshDevice,
     SetVolume(f32),
+    SetSlotVolume(SlotId, f32),
 }
 
 #[derive(Debug)]
@@ -96,6 +98,7 @@ struct Engine {
     mixer: Option<Mixer>,
 
     players: HashMap<SlotId, Player>,
+    gains: HashMap<SlotId, f32>,
     current_device: String,
     volume: f32,
     stream_generation: u64,
@@ -122,6 +125,7 @@ fn run_engine(
         sink: None,
         mixer: None,
         players: HashMap::new(),
+        gains: HashMap::new(),
         current_device: initial_device.clone(),
         volume: volume.clamp(0.0, 1.0),
     };
@@ -223,7 +227,15 @@ impl Engine {
 
     fn handle(&mut self, cmd: AudioCommand) {
         match cmd {
-            AudioCommand::Play { id, path, trim } => self.play_file(id, path, trim),
+            AudioCommand::Play {
+                id,
+                path,
+                trim,
+                volume,
+            } => {
+                self.gains.insert(id, volume.clamp(0.0, 1.0));
+                self.play_file(id, path, trim);
+            }
             AudioCommand::PlayTest => self.play_test_tone(),
             AudioCommand::Stop(id) => {
                 if self.players.remove(&id).is_some() {
@@ -244,10 +256,16 @@ impl Engine {
                 self.open_device(&name);
             }
             AudioCommand::RefreshDevice => self.open_device(&self.current_device.clone()),
+            AudioCommand::SetSlotVolume(id, gain) => {
+                if let Some(player) = self.players.get(&id) {
+                    self.gains.insert(id, gain.clamp(0.0, 1.0));
+                    player.set_volume(self.volume * gain.clamp(0.0, 1.0));
+                }
+            }
             AudioCommand::SetVolume(volume) => {
                 self.volume = volume.clamp(0.0, 1.0);
-                for player in self.players.values() {
-                    player.set_volume(self.volume);
+                for (id, player) in &self.players {
+                    player.set_volume(self.volume * self.gains.get(id).copied().unwrap_or(1.0));
                 }
             }
         }
@@ -300,7 +318,7 @@ impl Engine {
         self.players.remove(&id);
 
         let player = Player::connect_new(mixer);
-        player.set_volume(self.volume);
+        player.set_volume(self.volume * self.gains.get(&id).copied().unwrap_or(1.0));
         match trim.and_then(|t| {
             crate::waveform::trim_durations(t.start_frac, t.end_frac, t.duration_secs)
         }) {
@@ -338,6 +356,7 @@ impl Engine {
     }
 
     fn poll_finished(&mut self) {
+        self.gains.retain(|id, _| self.players.contains_key(id));
         if self.players.is_empty() {
             return;
         }
@@ -459,6 +478,7 @@ mod tests {
                 sink: None,
                 mixer: None,
                 players: HashMap::new(),
+                gains: HashMap::new(),
                 current_device: "requested cable".into(),
                 volume: 0.5,
                 stream_generation: 1,
@@ -474,6 +494,17 @@ mod tests {
             rodio::mixer::mixer(2.try_into().unwrap(), 44100.try_into().unwrap());
         engine.players.insert(id, Player::connect_new(&mixer));
         engine.mixer = Some(mixer);
+    }
+
+    #[test]
+    fn master_volume_preserves_individual_sound_balance() {
+        let (mut engine, _) = fake_engine();
+        add_fake_player(&mut engine, 7);
+        engine.handle(AudioCommand::SetSlotVolume(7, 0.25));
+        engine.handle(AudioCommand::SetVolume(0.8));
+        assert!((engine.players[&7].volume() - 0.2).abs() < 0.0001);
+        engine.handle(AudioCommand::SetSlotVolume(7, 0.5));
+        assert!((engine.players[&7].volume() - 0.4).abs() < 0.0001);
     }
 
     #[test]
@@ -563,6 +594,7 @@ mod tests {
             id: 7,
             path: PathBuf::from("/definitely/not/here-soundboard-test.mp3"),
             trim: None,
+            volume: 1.0,
         })
         .unwrap();
 
@@ -591,6 +623,7 @@ mod tests {
             id: 9,
             path: junk,
             trim: None,
+            volume: 1.0,
         })
         .unwrap();
 
@@ -627,6 +660,7 @@ mod tests {
             id: 3,
             path: wav,
             trim: None,
+            volume: 1.0,
         })
         .unwrap();
 
@@ -665,6 +699,7 @@ mod tests {
             id: 11,
             path: wav,
             trim: None,
+            volume: 1.0,
         })
         .unwrap();
         match next_event(&rx, Duration::from_secs(5)) {

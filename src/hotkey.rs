@@ -28,6 +28,7 @@ pub struct HotkeyBinding {
     pub path: Option<PathBuf>,
     pub action: BindingAction,
     pub trim: Option<TrimSpec>,
+    pub volume: f32,
 }
 
 impl HotkeyBinding {
@@ -38,6 +39,7 @@ impl HotkeyBinding {
             path: Some(path),
             action: BindingAction::Play,
             trim,
+            volume: 1.0,
         }
     }
 
@@ -48,6 +50,7 @@ impl HotkeyBinding {
             path: None,
             action: BindingAction::StopAll,
             trim: None,
+            volume: 1.0,
         }
     }
 }
@@ -58,6 +61,7 @@ pub struct PressTarget {
     pub path: Option<PathBuf>,
     pub action: BindingAction,
     pub trim: Option<TrimSpec>,
+    pub volume: f32,
 }
 
 #[derive(Debug)]
@@ -437,6 +441,7 @@ fn group_bindings(bindings: Vec<HotkeyBinding>) -> GroupedBindings {
                         path: binding.path.clone(),
                         action: binding.action,
                         trim: binding.trim,
+                        volume: binding.volume,
                     });
                 }
             }
@@ -464,6 +469,7 @@ fn dispatch_press(
                     id: target.id,
                     path: path.clone(),
                     trim: target.trim,
+                    volume: target.volume,
                 },
                 None => {
                     warn!("Hotkey target {:?} has no file; skipping.", target.id);
@@ -487,6 +493,21 @@ fn dispatch_press(
 mod tests {
     use super::*;
     use crate::model::Hotkey;
+
+    #[test]
+    fn hotkey_dispatch_preserves_sound_volume() {
+        let mut binding = HotkeyBinding::play(9, Hotkey::simple("F9"), "/sound.wav".into(), None);
+        binding.volume = 0.3;
+        let (groups, _) = group_bindings(vec![binding]);
+        let (key, group) = groups.into_iter().next().unwrap();
+        let routing = HashMap::from([(key.id(), group.targets)]);
+        let (audio_tx, audio_rx) = crossbeam_channel::unbounded();
+        let (event_tx, _) = crossbeam_channel::unbounded();
+        dispatch_press(&routing, key.id(), &audio_tx, &event_tx);
+        assert!(
+            matches!(audio_rx.try_recv(), Ok(AudioCommand::Play { volume, .. }) if volume == 0.3)
+        );
+    }
 
     #[test]
     fn grouping_carries_the_user_facing_label() {
@@ -715,12 +736,14 @@ mod tests {
                     path: Some(PathBuf::from("/a.mp3")),
                     action: BindingAction::Play,
                     trim: None,
+                    volume: 1.0,
                 },
                 PressTarget {
                     id: 2,
                     path: Some(PathBuf::from("/b.mp3")),
                     action: BindingAction::Play,
                     trim: None,
+                    volume: 1.0,
                 },
             ],
         );
@@ -736,6 +759,7 @@ mod tests {
             id,
             path,
             trim: None,
+            volume: 1.0,
         }) = audio_rx.try_recv()
         {
             got.push((id, path));
@@ -758,6 +782,7 @@ mod tests {
                 path: None,
                 action: BindingAction::StopAll,
                 trim: None,
+                volume: 1.0,
             }],
         );
 
@@ -810,6 +835,7 @@ mod tests {
                 path: None,
                 action: BindingAction::StopAll,
                 trim: None,
+                volume: 1.0,
             }],
         );
 

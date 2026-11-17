@@ -446,6 +446,11 @@ fn sanitize_slots(slots: Vec<SoundSlot>) -> Vec<SoundSlot> {
 
     let mut seen: HashSet<Hotkey> = HashSet::new();
     for slot in &mut clean {
+        slot.volume = if slot.volume.is_finite() {
+            slot.volume.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         if let Some(hotkey) = slot.hotkey.clone() {
             if !seen.insert(hotkey.clone()) {
                 warn!(
@@ -484,6 +489,7 @@ mod tests {
     fn slot(id: SlotId, name: &str, hotkey: Option<Hotkey>, path: Option<&str>) -> SoundSlot {
         SoundSlot {
             id,
+            volume: 1.0,
             name: name.to_owned(),
             file_path: path.map(PathBuf::from),
             hotkey,

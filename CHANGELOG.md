@@ -1,5 +1,19 @@
 # Changelog
 
+## [v0.1.4] — 2026-11-17
+
+### User experience
+- **UI:** reorganized navigation around a responsive board sidebar, with a compact selector in narrow windows. Search filters the active board; master output and volume controls stay at the bottom.
+- **Routing:** the footer continuously shows the actual output and any fallback or unavailable status while preserving the selected device preference.
+- **Sound management:** add multiple supported audio files at once or drop files onto the app; rename and reorder sounds, adjust per-sound volume, and undo recent edits.
+- **Boards:** import and export self-contained `.osboard` bundles with their audio. Imported boards receive new IDs and unassigned hotkeys.
+- **Recording:** moved microphone selection and controls into a dedicated panel with a live input meter, timer, start, save, and cancel actions.
+- **Playback:** per-sound gain applies to both clicks and global hotkeys. UI state tracks pending playback, and recording/output use explicit states.
+
+### Limits
+- Undo keeps up to 20 snapshots for the current session. Bundles allow up to 64 MB of audio and up to 256 MB encoded size.
+
+
 ## [v0.1.3] — 2026-10-31
 
 ### Bug fixes
@@ -56,4 +70,5 @@
 [v0.1.2]: https://github.com/IAmThroot/Open-Soundboard/releases/tag/v0.1.2
 [v0.1.1]: https://github.com/IAmThroot/Open-Soundboard/releases/tag/v0.1.1
 
+[v0.1.4]: https://github.com/IAmThroot/Open-Soundboard/releases/tag/v0.1.4
 [v0.1.3]: https://github.com/IAmThroot/Open-Soundboard/releases/tag/v0.1.3

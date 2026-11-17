@@ -8,7 +8,7 @@ Designed for gamers, streamers, podcasters, and everyday users who want a soundb
 
 ---
 
-##  Features
+## Features
 
 - ** Global System-Wide Hotkeys**  
   Trigger sounds from anywhere—even while tabbed into full-screen games or when the soundboard is minimized to the system tray. Supports single keys (`F1`–`F24`, letters, numbers, numpad, media keys) and composite chords (e.g. `Ctrl+Alt+1`, `Shift+F5`).
@@ -25,7 +25,7 @@ Designed for gamers, streamers, podcasters, and everyday users who want a soundb
 - **💾 Automatic Atomic Persistence**  
   No manual save buttons. Your boards, sound configurations, volume levels, and hotkey bindings are saved atomically to `%APPDATA%\OpenSoundboard\Open Soundboard\config\config.json`, preventing config corruption even during unexpected shutdowns.
 - **⚡ Ultra-Lightweight & Native**  
-  Written 100% in Rust using `eframe`/`egui`, `rodio`, and `cpal`. Uses almost no CPU at idle and starts instantly.
+  Written written in Rust using `eframe`/`egui`, `rodio`, and `cpal`. Designed for low idle CPU use and quick startup.
 
 ---
 
@@ -45,7 +45,7 @@ Open Soundboard runs on **64-bit Windows 10 and Windows 11**.
 
 ### Option 2: Portable Zip
 
-1. Download **`OpenSoundboard-0.1.3-portable.zip`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
+1. Download **`OpenSoundboard-0.1.4-portable.zip`** from the [Releases](https://github.com/IAmThroot/Open-Soundboard/releases) page.
 2. Extract the folder anywhere on your computer (e.g., `Documents` or a USB flash drive).
 3. Double-click `open-soundboard.exe` to run. No files are written to `Program Files` or the Windows Registry.
 
@@ -73,7 +73,7 @@ cargo run --release
 To compile the Windows installer locally, install [Inno Setup 6](https://jrsoftware.org/isdl.php) and run:
 ```powershell
 cargo build --release
-iscc /DMyAppVersion=0.1.3 packaging\installer.iss
+iscc /DMyAppVersion=0.1.4 packaging\installer.iss
 ```
 
 ---
@@ -81,12 +81,12 @@ iscc /DMyAppVersion=0.1.3 packaging\installer.iss
 ## 📖 Usage Guide
 
 ### 1. Adding Sounds
-- Click **+ Add Sound** on any empty tile or in the top toolbar.
+- Click **+ Add sound** beside the board name, or drag audio files onto the window.
 - Browse and select your audio file (`.mp3`, `.wav`, `.ogg`, `.flac`, `.m4a`, or `.aac`).
 - The tile automatically derives its label from the audio file name.
 
 ### 2. Binding Global Hotkeys
-- Click the **[Set Key]** button on any sound tile.
+- Open the **…** menu on a sound tile and choose its hotkey control.
 - Press the key or combination you want to bind (for example, `F7`, `Ctrl+Shift+D`, or `Numpad 1`).
 - To cancel or clear a key binding, press `Esc` while recording.
 - The hotkey will immediately work system-wide, even when Open Soundboard is minimized or playing a game.
@@ -94,26 +94,25 @@ iscc /DMyAppVersion=0.1.3 packaging\installer.iss
 ### 3. Routing Audio into Discord / Games / Zoom
 To play sounds into voice chat so your friends or teammates can hear them:
 1. Install a virtual audio device such as **[VB-Audio Virtual Cable](https://vb-audio.com/Cable/)** (free).
-2. In Open Soundboard, open the audio device dropdown in the toolbar and select **`CABLE Input (VB-Audio Virtual Cable)`**.
+2. In Open Soundboard, open the audio device dropdown at the bottom and select **`CABLE Input (VB-Audio Virtual Cable)`**.
 3. In Discord, Zoom, or your game's audio settings, set your **Input Device (Microphone)** to **`CABLE Output (VB-Audio Virtual Cable)`**.
 4. *(Optional — Hear your own sounds):* If you want to hear the sounds in your own headphones simultaneously, enable "Listen to this device" for CABLE Output in the Windows Sound Control Panel, or use software like Voicemeeter / SteelSeries Sonar.
 
 ### 4. Trimming Audio Clips
-- Click the **✎** (edit) icon on any sound tile.
+- Open the **…** menu on a sound tile and choose **Trim sound**.
 - An interactive waveform modal will appear.
 - Drag the **blue start handle** and **blue end handle** to isolate the exact section of the sound you want.
 - Click **▶ Play** to test your trim boundaries.
 - Click **Save**. Hotkeys and clicks will now play only the trimmed segment.
 
 ### 5. Recording from your Microphone
-- In the top toolbar, select your physical microphone from the input picker.
-- Click **Record**. Speak or play the sound you wish to capture.
-- Click **Stop Recording**.
+- Click **Record** beside the board name, select your microphone, then click **Start recording**. Speak or play the sound you wish to capture.
+- Click **Stop and save**, or **Cancel take** to discard the recording.
 - The recording is streamed directly to `%APPDATA%\OpenSoundboard\Open Soundboard\data\recordings\`, and a new tile is added to your board ready for hotkey assignment. A single take is capped at 10 minutes. If opening takes longer than eight seconds, the attempt is cancelled and Record stays disabled until the driver returns; restart the app if it remains stuck.
 - Only one copy of Open Soundboard runs at a time, so two windows can't overwrite the same layout.
 
 ### 6. System Tray & Background Operation
-- Click the **⚙ (Settings)** button in the toolbar.
+- Click **Settings** in the header.
 - Toggle **"Minimize / Close to System Tray"**.
 - Closing the window now hides Open Soundboard to the notification area near your clock.
 - Left-click or double-click the tray icon to restore the window, or right-click to quit.
@@ -128,6 +127,16 @@ To play sounds into voice chat so your friends or teammates can hear them:
 
 ---
 
-##  License
+## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Sound Management & Boards
+
+- Add multiple sounds at once with **Add sound**, or drop MP3, WAV, OGG, FLAC, M4A, or AAC files onto the window.
+- Open a tile's **…** menu to rename it, adjust its volume, move it earlier/later, trim it, or remove it. Drag its grip onto another tile to place it before that sound.
+- Sound volume multiplies master volume and applies to both clicks and hotkeys.
+- **Undo** restores recent board edits, including removed sounds/boards, ordering, names, and trim changes. History holds 20 snapshots for this session; audio files are retained.
+- **Export board** creates an `.osboard` bundle containing board settings and audio. **Import board** copies audio into app storage and assigns new IDs. Imported hotkeys start unassigned to avoid conflicts.
+- Bundles support up to 64 MB of audio and 256 MB of encoded bundle data. A missing source file prevents export; restore it first.
+- The output footer shows opening, actual output/fallback, or unavailable status. The selected output preference is preserved during fallback.

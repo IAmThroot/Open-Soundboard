@@ -29,8 +29,11 @@ const SLOT_PAD: f32 = 12.0;
 const SLOT_GAP: f32 = 12.0;
 
 enum SlotAction {
-    AddViaPicker,
     Play(SlotId),
+    Rename(SlotId),
+    Move(SlotId, isize),
+    MoveBefore(SlotId, SlotId),
+    Volume(SlotId, f32),
     Stop(SlotId),
     StartRecording(SlotId),
     ClearHotkey(SlotId),
@@ -72,6 +75,30 @@ struct Toast {
     until: Instant,
 }
 
+enum OutputState {
+    Opening,
+    Ready {
+        actual: String,
+        warning: Option<String>,
+    },
+    Unavailable(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RecordingPhase {
+    Opening,
+    Recording,
+    Finishing,
+    Cancelling,
+}
+
+struct RecordingSession {
+    attempt: RecordAttempt,
+    board: BoardId,
+    since: Instant,
+    phase: RecordingPhase,
+}
+
 pub struct SoundboardApp {
     boards: Vec<Board>,
     active_board: BoardId,
@@ -90,15 +117,8 @@ pub struct SoundboardApp {
     record_tx: Sender<RecordCommand>,
     record_rx: Receiver<RecordMessage>,
 
-    mic: Option<MicTake>,
-
-    mic_starting: Option<Instant>,
-    mic_attempt: Option<RecordAttempt>,
+    mic_session: Option<RecordingSession>,
     next_mic_attempt: u64,
-
-    /// Board that was active when the user pressed Record; the finished take
-    /// is added there even if they switch boards while recording.
-    mic_start_board: Option<BoardId>,
 
     mic_devices: Vec<String>,
     mic_device: String,
@@ -125,6 +145,7 @@ pub struct SoundboardApp {
     recording: Option<SlotId>,
 
     playing: HashSet<SlotId>,
+    pending_playback: HashSet<SlotId>,
 
     /// The trim editor's preview uses `PREVIEW_TRIM_ID`; it is tracked
     /// separately so Stop All can enable/disable correctly.
@@ -149,6 +170,12 @@ pub struct SoundboardApp {
     close_to_tray: bool,
 
     settings_open: bool,
+    recorder_open: bool,
+    search: String,
+    rename_sound: Option<(SlotId, String)>,
+    undo: Vec<(Vec<Board>, BoardId)>,
+    bundle_job: Option<Receiver<Result<Option<Board>, String>>>,
+    output_state: OutputState,
 
     quit_requested: bool,
 
@@ -308,11 +335,6 @@ const TIMER_FRAME: Duration = Duration::from_millis(100);
 
 const MIC_START_TIMEOUT: Duration = Duration::from_secs(8);
 
-struct MicTake {
-    started: Instant,
-    board: BoardId,
-}
-
 #[derive(Clone)]
 enum HotkeyBackendState {
     Starting,
@@ -400,11 +422,8 @@ impl SoundboardApp {
             hotkey_state: HotkeyBackendState::Starting,
             record_tx,
             record_rx,
-            mic: None,
-            mic_starting: None,
-            mic_attempt: None,
+            mic_session: None,
             next_mic_attempt: 1,
-            mic_start_board: None,
             mic_devices,
             mic_device,
             stop_hotkey,
@@ -421,6 +440,7 @@ impl SoundboardApp {
             next_slot_id,
             recording: None,
             playing: HashSet::new(),
+            pending_playback: HashSet::new(),
             preview_playing: false,
             testing: false,
             confirm: None,
@@ -433,6 +453,12 @@ impl SoundboardApp {
             tray: Tray::new(&cc.egui_ctx),
             close_to_tray,
             settings_open: false,
+            recorder_open: false,
+            search: String::new(),
+            rename_sound: None,
+            undo: Vec::new(),
+            bundle_job: None,
+            output_state: OutputState::Opening,
             quit_requested: false,
             window_visible: true,
         };
@@ -516,6 +542,9 @@ impl SoundboardApp {
             .show(ctx, |ui| {
 
 
+                ui.label(format!("Open Soundboard v{}", env!("CARGO_PKG_VERSION")));
+                ui.hyperlink_to(AUTHOR_CREDIT, AUTHOR_URL);
+                ui.separator();
                 ui.add_enabled_ui(self.tray.is_some(), |ui| {
                     if ui
                         .checkbox(
@@ -604,6 +633,7 @@ impl SoundboardApp {
     }
 
     fn set_hotkey(&mut self, id: SlotId, hotkey: Hotkey) {
+        self.checkpoint();
         let display = hotkey.display();
         debug!("Hotkey stored: slot={id} key={display}.");
         let risky = hotkey.looks_like_typing();
@@ -639,12 +669,14 @@ impl SoundboardApp {
             .iter()
             .filter(|s| !s.missing && !self.broken.contains(&s.id))
             .filter_map(|s| {
-                Some(HotkeyBinding::play(
+                let mut binding = HotkeyBinding::play(
                     s.id,
                     s.hotkey.clone()?,
                     s.file_path.clone()?,
                     trim_spec_for(s),
-                ))
+                );
+                binding.volume = s.volume;
+                Some(binding)
             })
             .collect();
         if let Some(stop) = &self.stop_hotkey {
@@ -675,11 +707,13 @@ impl SoundboardApp {
         self.testing = false;
         self.send(AudioCommand::StopAll);
         self.active_board = id;
+        self.search.clear();
         self.push_hotkey_rebuild();
         self.mark_dirty();
     }
 
     fn add_board(&mut self) {
+        self.checkpoint();
         let mut n = self.boards.len() + 1;
         loop {
             let name = format!("Board {n}");
@@ -702,6 +736,7 @@ impl SoundboardApp {
             return;
         };
         let deleting_active = id == self.active_board;
+        self.checkpoint();
         let removed: Board = self.boards.remove(pos);
         let capture_removed = self
             .recording
@@ -864,39 +899,38 @@ impl SoundboardApp {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let frame = Frame::NONE
-            .fill(theme::PANEL)
-            .inner_margin(Margin::symmetric(16, 12));
-
-        egui::Panel::top("top_bar")
-            .frame(frame)
-            .show_separator_line(false)
+        egui::Panel::top("header")
+            .frame(
+                Frame::NONE
+                    .fill(theme::PANEL)
+                    .inner_margin(Margin::symmetric(18, 12)),
+            )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("🔊  Open Soundboard").size(18.0).strong());
+                    ui.label(RichText::new("Open Soundboard").size(19.0).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .size(11.5)
-                                .color(theme::MUTED),
+                        if ui.button("Settings").clicked() {
+                            self.settings_open = true;
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search)
+                                .hint_text("Search this board…")
+                                .desired_width(170.0),
                         );
-                        ui.label(RichText::new("·").size(11.5).color(theme::MUTED));
-
-                        ui.hyperlink_to(
-                            RichText::new(AUTHOR_CREDIT).size(11.5).color(theme::MUTED),
-                            AUTHOR_URL,
-                        )
-                        .on_hover_text(format!("Open {AUTHOR_URL} in your browser"));
                     });
                 });
+            });
+    }
 
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Where should it play?").size(13.5));
+    fn master_controls(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("master_controls")
+.frame(Frame::NONE.fill(theme::PANEL).inner_margin(Margin::symmetric(16, 10)))
+.show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Output");
                     let before = self.output_device.clone();
                     egui::ComboBox::from_id_salt("output_device")
-                        .selected_text(self.output_device.clone())
+                        .selected_text(ellipsize(&self.output_device, 34))
                         .width(260.0)
                         .show_ui(ui, |ui| {
                             for device in self.output_devices.clone() {
@@ -911,6 +945,7 @@ impl SoundboardApp {
                     if self.output_device != before {
                         self.playing.clear();
                         self.testing = false;
+                        self.output_state = OutputState::Opening;
                         self.send(AudioCommand::SetDevice(self.output_device.clone()));
                         self.mark_dirty();
                         self.toast(
@@ -929,6 +964,7 @@ impl SoundboardApp {
                         if !self.output_devices.contains(&self.output_device) {
                             self.output_devices.insert(1, self.output_device.clone());
                         }
+                        self.output_state = OutputState::Opening;
                         self.send(AudioCommand::RefreshDevice);
                         self.toast(
                             ToastKind::Info,
@@ -937,9 +973,9 @@ impl SoundboardApp {
                     }
 
                     let test_label = if self.testing {
-                        "🔈  Playing…"
+                        "Testing…"
                     } else {
-                        "🔈  Test Sound"
+                        "Test"
                     };
                     if ui
                         .add_enabled(!self.testing, Button::new(test_label))
@@ -949,11 +985,8 @@ impl SoundboardApp {
                         self.testing = true;
                         self.send(AudioCommand::PlayTest);
                     }
-                });
-
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
+            });
+            ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Volume").size(13.5));
                     let slider = ui.add(
                         egui::Slider::new(&mut self.volume, 0.0..=1.0)
@@ -969,42 +1002,9 @@ impl SoundboardApp {
                             .size(12.5)
                             .color(theme::MUTED),
                     );
-                });
-
-                ui.add_space(4.0);
-
-                ui.label(
-                    RichText::new(
-                        "Tip: to play through your mic in Discord, Zoom or a game, install a \
-                         virtual cable and pick it in the list above.",
-                    )
-                    .size(11.5)
-                    .color(theme::MUTED),
-                );
-            });
-    }
-
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let frame = Frame::NONE
-            .fill(theme::BG)
-            .inner_margin(Margin::symmetric(16, 10));
-
-        egui::Panel::top("toolbar")
-            .frame(frame)
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                    let any_playing = !self.pending_playback.is_empty() || !self.playing.is_empty() || self.testing || self.preview_playing;
                     if ui
-                        .add(Button::new(RichText::new("➕  Add Sound").strong()))
-                        .on_hover_text("Pick a sound file from your computer")
-                        .clicked()
-                    {
-                        self.add_sound_via_picker();
-                    }
-
-                    let any_playing = !self.playing.is_empty() || self.testing || self.preview_playing;
-                    if ui
-                        .add_enabled(any_playing, Button::new(RichText::new("⏹  Stop All")))
+                        .add_enabled(any_playing, Button::new(RichText::new("■ Stop all")))
                         .on_hover_text("Stop every sound right now")
                         .clicked()
                     {
@@ -1080,174 +1080,287 @@ impl SoundboardApp {
                         );
                     }
 
-                    if let Some(take) = &self.mic {
-                        let elapsed = fmt_time(take.started.elapsed().as_secs_f32());
-                        if ui
-                            .add_sized(
-                                [110.0, 26.0],
-                                Button::new(
-                                    RichText::new(format!("■ Stop {elapsed}"))
-                                        .size(12.5)
-                                        .color(Color32::WHITE),
-                                )
-                                .fill(theme::DANGER)
-                                .corner_radius(CornerRadius::same(8)),
-                            )
-                            .on_hover_text(
-                                "Stop recording and keep the take (quitting discards it)",
-                            )
-                            .clicked()
-                        {
-                            let _ = self.record_tx.send(RecordCommand::Stop);
-                            self.toast(ToastKind::Info, "Finishing the take…");
-                        }
-                    } else {
-                        let starting = self.mic_starting.is_some();
-                        ui.add_enabled_ui(!starting, |ui| {
-                            let mut chosen = self.mic_device.clone();
-                            egui::ComboBox::from_id_salt("mic_device")
-                                .selected_text(
-                                    RichText::new(shorten_device(&self.mic_device)).size(12.0),
-                                )
-                                .width(150.0)
-                                .show_ui(ui, |ui| {
-                                    for device in self.mic_devices.clone() {
-                                        ui.selectable_value(&mut chosen, device.clone(), device);
-                                    }
-                                });
-                            if chosen != self.mic_device {
-                                self.mic_device = chosen;
-                                self.mark_dirty();
-                            }
-                            if ui
-                                .small_button("↻")
-                                .on_hover_text("Look for newly plugged in microphones")
-                                .clicked()
-                            {
-                                self.mic_devices = crate::devices::list_input_devices();
-                                if !self.mic_devices.contains(&self.mic_device) {
-                                    self.mic_device = SYSTEM_DEFAULT_LABEL.to_owned();
-                                    self.mark_dirty();
-                                }
-                            }
-                        });
-                        if starting {
-                            ui.add_enabled_ui(false, |ui| {
-                                ui.add_sized(
-                                    [90.0, 26.0],
-                                    egui::Button::new(
-                                        RichText::new(if self.mic_attempt.as_ref().is_some_and(|a| a.is_cancelled()) { "Waiting for driver…" } else { "● Starting…" }).size(12.5).color(theme::MUTED),
-                                    )
-                                    .fill(theme::BG_SOFT)
-                                    .corner_radius(CornerRadius::same(8)),
-                                );
-                            });
-                        } else if ui
-                            .add_sized(
-                                [90.0, 26.0],
-                                Button::new(
-                                    RichText::new("● Record").size(12.5).color(theme::TEXT),
-                                )
-                                .fill(theme::BG_SOFT)
-                                .stroke(Stroke::new(1.0, theme::BORDER))
-                                .corner_radius(CornerRadius::same(8)),
-                            )
-                            .on_hover_text("Record from the selected microphone into this board")
-                            .clicked()
-                        {
-                            let device = (self.mic_device != SYSTEM_DEFAULT_LABEL)
-                                .then(|| self.mic_device.clone());
-                            self.mic_starting = Some(Instant::now());
-                            self.mic_start_board = Some(self.active_board);
-                            let attempt = RecordAttempt::new(self.next_mic_attempt);
-                            self.next_mic_attempt = self.next_mic_attempt.wrapping_add(1);
-                            self.mic_attempt = Some(attempt.clone());
-                            if self.record_tx.send(RecordCommand::Start { device, attempt }).is_err() {
-                                self.mic_attempt = None;
-                                self.mic_starting = None;
-                                self.mic_start_board = None;
-                                self.toast(ToastKind::Warn, "The recorder stopped unexpectedly. Restart the app to record again.");
-                            }
-                        }
-                    }
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let count = self.active().slots.len();
-                        let plural = if count == 1 { "" } else { "s" };
-                        ui.label(
-                            RichText::new(format!("{count} sound{plural}"))
-                                .size(12.5)
-                                .color(theme::MUTED),
+            });
+            match &self.output_state {
+                OutputState::Opening => { ui.label("Opening output…"); }
+                OutputState::Unavailable(message) => { ui.label(RichText::new(format!("Output unavailable: {message}")).color(theme::WARN)); }
+                OutputState::Ready { actual, warning } => {
+                    ui.label(RichText::new(format!("Playing through: {actual}")).small().color(theme::MUTED));
+                    if let Some(warning) = warning { ui.label(RichText::new(warning).color(theme::WARN)); }
+                }
+            }
+
+        });
+    }
+
+    fn bundle_action(&mut self, import: bool) {
+        if self.bundle_job.is_some() {
+            return;
+        }
+        let dialog = rfd::FileDialog::new().add_filter("Soundboard bundle", &["osboard"]);
+        let path = if import {
+            dialog.pick_file()
+        } else {
+            dialog.set_file_name("board.osboard").save_file()
+        };
+        let Some(path) = path else {
+            return;
+        };
+        let board = self.active().clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.bundle_job = Some(rx);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = if import {
+                crate::paths::recordings_dir()
+                    .and_then(|root| {
+                        crate::board_bundle::import(&path, &root.join("imported-boards"))
+                    })
+                    .map(Some)
+            } else {
+                crate::board_bundle::export(board, &path).map(|()| None)
+            };
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_bundle(&mut self) {
+        let result = self.bundle_job.as_ref().map(|rx| rx.try_recv());
+        match result {
+            Some(Ok(result)) => {
+                self.bundle_job = None;
+                match result {
+                    Ok(Some(mut board)) => {
+                        self.checkpoint();
+                        board.id = self.alloc_board_id();
+                        for slot in &mut board.slots {
+                            slot.id = self.alloc_id();
+                        }
+                        let id = board.id;
+                        self.boards.push(board);
+                        self.switch_board(id);
+                        self.toast(
+                            ToastKind::Good,
+                            "Board imported. Assign hotkeys when ready.",
                         );
+                    }
+                    Ok(None) => self.toast(ToastKind::Good, "Board exported with its audio files."),
+                    Err(message) => self.toast(ToastKind::Warn, message),
+                }
+            }
+            Some(Err(crossbeam_channel::TryRecvError::Disconnected)) => {
+                self.bundle_job = None;
+                self.toast(ToastKind::Warn, "Board transfer stopped unexpectedly.");
+            }
+            _ => {}
+        }
+    }
 
-                        if ui.small_button("⚙").on_hover_text("Settings").clicked() {
-                            self.settings_open = true;
-                        }
-                    });
+    fn board_menu(&mut self, ui: &mut egui::Ui, id: BoardId) {
+        let Some(board) = self.boards.iter().find(|b| b.id == id) else {
+            return;
+        };
+        let name = board.name.clone();
+        let sounds = board.slots.len();
+        ui.menu_button("…", |ui| {
+            if ui.button("Rename board").clicked() {
+                self.board_dialog = Some(BoardDialog::Rename {
+                    id,
+                    name: name.clone(),
+                    focused: false,
                 });
+                ui.close();
+            }
+            if ui
+                .add_enabled(self.boards.len() > 1, Button::new("Delete board"))
+                .clicked()
+            {
+                self.board_dialog = Some(BoardDialog::Delete { id, name, sounds });
+                ui.close();
+            }
+        });
+    }
 
-                ui.add_space(4.0);
-
+    fn navigation(&mut self, ui: &mut egui::Ui) {
+        if ui.available_width() < 780.0 {
+            egui::Panel::top("compact_boards").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Board").size(13.5).color(theme::MUTED));
-                    let before = self.active_board;
                     let mut selected = self.active_board;
-                    egui::ComboBox::from_id_salt("board_switcher")
-                        .selected_text(self.active().name.clone())
-                        .width(180.0)
+                    egui::ComboBox::from_id_salt("boards")
+                        .selected_text(ellipsize(&self.active().name, 24))
                         .show_ui(ui, |ui| {
                             for board in &self.boards {
                                 ui.selectable_value(&mut selected, board.id, &board.name);
                             }
                         });
-                    if selected != before {
-                        self.switch_board(selected);
-                    }
-
-                    if ui
-                        .small_button("+ New")
-                        .on_hover_text("Create a new empty board and switch to it")
-                        .clicked()
-                    {
+                    self.switch_board(selected);
+                    self.board_menu(ui, self.active_board);
+                    if ui.button("+ New board").clicked() {
                         self.add_board();
-                    }
-
-                    let active_id = self.active_board;
-                    let active_name = self.active().name.clone();
-                    if ui
-                        .small_button("✎ Rename")
-                        .on_hover_text("Rename this board")
-                        .clicked()
-                    {
-                        self.board_dialog = Some(BoardDialog::Rename {
-                            id: active_id,
-                            name: active_name.clone(),
-                            focused: false,
-                        });
-                    }
-
-                    let can_delete = self.boards.len() > 1;
-                    if ui
-                        .add_enabled(
-                            can_delete,
-                            Button::new(RichText::new("🗑 Delete").size(12.5)),
-                        )
-                        .on_hover_text(if can_delete {
-                            "Delete this board and all its sounds"
-                        } else {
-                            "You need at least one board"
-                        })
-                        .clicked()
-                    {
-                        let sounds = self.active().slots.len();
-                        self.board_dialog = Some(BoardDialog::Delete {
-                            id: active_id,
-                            name: active_name.clone(),
-                            sounds,
-                        });
                     }
                 });
             });
+        } else {
+            egui::Panel::left("boards_sidebar")
+                .exact_size(176.0)
+                .frame(Frame::NONE.fill(theme::PANEL).inner_margin(12))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("BOARDS").small().color(theme::MUTED));
+                    if ui.button("+ New board").clicked() {
+                        self.add_board();
+                    }
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let boards: Vec<_> =
+                            self.boards.iter().map(|b| (b.id, b.name.clone())).collect();
+                        for (id, name) in boards {
+                            ui.push_id(id, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_sized(
+                                            [108.0, 32.0],
+                                            egui::Button::new(ellipsize(&name, 16))
+                                                .selected(id == self.active_board),
+                                        )
+                                        .on_hover_text(&name)
+                                        .clicked()
+                                    {
+                                        self.switch_board(id);
+                                    }
+                                    self.board_menu(ui, id);
+                                });
+                            });
+                        }
+                    });
+                });
+        }
+    }
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("board_heading")
+            .frame(
+                Frame::NONE
+                    .fill(theme::BG)
+                    .inner_margin(Margin::symmetric(16, 14)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(ellipsize(&self.active().name, 28))
+                            .size(21.0)
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(format!("{} sounds", self.active().slots.len()))
+                            .color(theme::MUTED),
+                    );
+                    if ui
+                        .add_enabled(!self.undo.is_empty(), Button::new("Undo"))
+                        .clicked()
+                    {
+                        self.undo_edit();
+                    }
+                    if ui
+                        .add_enabled(self.bundle_job.is_none(), Button::new("Import board"))
+                        .clicked()
+                    {
+                        self.bundle_action(true);
+                    }
+                    if ui
+                        .add_enabled(self.bundle_job.is_none(), Button::new("Export board"))
+                        .clicked()
+                    {
+                        self.bundle_action(false);
+                    }
+                    if self.bundle_job.is_some() {
+                        ui.label("Transferring board…");
+                    }
+                    if ui.button("+ Add sound").clicked() {
+                        self.add_sound_via_picker();
+                    }
+                    let label = if self
+                        .mic_session
+                        .as_ref()
+                        .is_some_and(|s| s.phase == RecordingPhase::Recording)
+                    {
+                        "Recording…"
+                    } else {
+                        "Record"
+                    };
+                    if ui.button(label).clicked() {
+                        self.recorder_open = true;
+                    }
+                });
+            });
+    }
+
+    fn recorder_window(&mut self, ctx: &egui::Context) {
+        if !self.recorder_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Record a sound")
+            .open(&mut open).resizable(false).default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label("Stop saves the take. Cancel discards it.");
+                let busy = self.mic_session.is_some();
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Microphone");
+                        let previous = self.mic_device.clone();
+                        egui::ComboBox::from_id_salt("mic_device")
+                            .selected_text(shorten_device(&self.mic_device))
+                            .show_ui(ui, |ui| {
+                                for name in &self.mic_devices {
+                                    ui.selectable_value(&mut self.mic_device, name.clone(), name);
+                                }
+                            });
+                        if previous != self.mic_device { self.mark_dirty(); }
+                        if ui.button("Refresh").clicked() {
+                            self.mic_devices = crate::devices::list_input_devices();
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                if let Some(take) = self.mic_session.as_ref().filter(|s| s.phase == RecordingPhase::Recording) {
+                    ui.label(RichText::new(format!("Recording  {}", fmt_time(take.since.elapsed().as_secs_f32()))).size(24.0).color(theme::DANGER));
+                    if let Some(attempt) = self.mic_session.as_ref().map(|s| &s.attempt) {
+                        ui.add(egui::ProgressBar::new(attempt.level()).text("Microphone level"));
+                    }
+                    if ui.button("■ Stop and save").clicked() {
+                        if self.record_tx.send(RecordCommand::Stop).is_err() {
+                            self.toast(ToastKind::Warn, "Recorder unavailable. Restart the app.");
+                        } else {
+                            if let Some(session) = &mut self.mic_session { session.phase = RecordingPhase::Finishing; }
+                            self.toast(ToastKind::Info, "Finishing the take…");
+                        }
+                    }
+                } else if busy {
+                    ui.label(match self.mic_session.as_ref().map(|s| s.phase) {
+                        Some(RecordingPhase::Finishing) => "Saving recording…",
+                        Some(RecordingPhase::Cancelling) => "Cancelling recording…",
+                        _ => "Opening microphone…",
+                    });
+                } else if ui.button("● Start recording").clicked() {
+                    let device = (self.mic_device != SYSTEM_DEFAULT_LABEL).then(|| self.mic_device.clone());
+                    let attempt = RecordAttempt::new(self.next_mic_attempt);
+                    self.next_mic_attempt = self.next_mic_attempt.wrapping_add(1);
+                    self.mic_session = Some(RecordingSession { attempt: attempt.clone(), board: self.active_board, since: Instant::now(), phase: RecordingPhase::Opening });
+                    if self.record_tx.send(RecordCommand::Start { device, attempt }).is_err() {
+                        self.mic_session = None;
+                        self.toast(ToastKind::Warn, "Recorder unavailable. Restart the app.");
+                    }
+                }
+                if let Some(attempt) = self.mic_session.as_ref().map(|s| &s.attempt) {
+                    if attempt.is_cancelled() {
+                        ui.label(RichText::new("Waiting for the microphone to stop. Restart the app if the driver never returns.").color(theme::WARN));
+                    } else if ui.button("Cancel take").clicked() { attempt.cancel(); }
+                    ui.label(RichText::new("Closing this panel keeps the recording running.").small().color(theme::MUTED));
+                }
+            });
+        self.recorder_open = open;
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1265,7 +1378,7 @@ impl SoundboardApp {
             .frame(frame)
             .show_separator_line(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| match &self.hotkey_state {
+                ui.horizontal_wrapped(|ui| match &self.hotkey_state {
                     HotkeyBackendState::Active => {
                         ui.label(
                             RichText::new("●  Listening in the background")
@@ -1310,7 +1423,8 @@ impl SoundboardApp {
                         )
                         .wrap(),
                     );
-                } else if let Some(err) = &self.save_error {
+                }
+                if let Some(err) = &self.save_error {
                     ui.add_space(2.0);
                     ui.add(
                         egui::Label::new(
@@ -1344,7 +1458,7 @@ impl SoundboardApp {
                             );
                             ui.add_space(6.0);
                             ui.label(
-                                RichText::new("Click \"➕  Add Sound\" to create your first slot.")
+                                RichText::new("Click \"+ Add sound\" to create your first slot.")
                                     .color(theme::MUTED),
                             );
                         });
@@ -1357,8 +1471,19 @@ impl SoundboardApp {
                     let columns =
                         (((avail + SLOT_GAP) / (SLOT_W + SLOT_GAP)).floor() as usize).max(1);
 
-                    let total = self.active().slots.len() + 1;
-                    let indices: Vec<usize> = (0..total).collect();
+                    let query = self.search.trim().to_lowercase();
+                    let indices: Vec<usize> = self
+                        .active()
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, slot)| slot.name.to_lowercase().contains(&query))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if indices.is_empty() {
+                        ui.label("No sounds match your search.");
+                    }
+                    let tile_width = (avail - SLOT_GAP * (columns - 1) as f32) / columns as f32;
 
                     for row in indices.chunks(columns) {
                         ui.horizontal(|ui| {
@@ -1372,13 +1497,16 @@ impl SoundboardApp {
                                         .as_ref()
                                         .map(|k| self.rejected_hotkeys.contains(&k.display()))
                                         .unwrap_or(false);
-                                    if let Some(action) =
-                                        draw_slot(ui, slot, playing, recording, rejected)
-                                    {
+                                    let action = ui
+                                        .push_id(slot.id, |ui| {
+                                            draw_slot(
+                                                ui, slot, playing, recording, rejected, tile_width,
+                                            )
+                                        })
+                                        .inner;
+                                    if let Some(action) = action {
                                         actions.push(action);
                                     }
-                                } else {
-                                    draw_add_tile(ui, actions);
                                 }
                             }
                         });
@@ -1539,6 +1667,7 @@ impl SoundboardApp {
             self.board_dialog = None;
         }
         if let Some((id, name)) = save_rename {
+            self.checkpoint();
             let name = name.trim().to_owned();
             if name.is_empty() {
                 self.toast(ToastKind::Warn, "A board needs a name.");
@@ -1613,6 +1742,18 @@ impl SoundboardApp {
     }
 
     fn send(&mut self, cmd: AudioCommand) {
+        match &cmd {
+            AudioCommand::Play { id, .. } => {
+                self.pending_playback.insert(*id);
+            }
+            AudioCommand::Stop(id) => {
+                self.pending_playback.remove(id);
+            }
+            AudioCommand::StopAll => {
+                self.pending_playback.clear();
+            }
+            _ => {}
+        }
         let mut cmd = cmd;
         if let Err(err) = self.audio_tx.send(cmd) {
             log::error!("Audio engine send failed ({err}); restarting engine.");
@@ -1646,6 +1787,7 @@ impl SoundboardApp {
         while let Ok(event) = self.audio_rx.try_recv() {
             match event {
                 AudioEvent::Started(id) => {
+                    self.pending_playback.remove(&id);
                     if id == TEST_SOUND_ID {
                         self.testing = true;
                     } else if id == PREVIEW_TRIM_ID {
@@ -1658,6 +1800,7 @@ impl SoundboardApp {
                     }
                 }
                 AudioEvent::Finished(id) => {
+                    self.pending_playback.remove(&id);
                     if id == TEST_SOUND_ID {
                         self.testing = false;
                     } else if id == PREVIEW_TRIM_ID {
@@ -1667,6 +1810,7 @@ impl SoundboardApp {
                     }
                 }
                 AudioEvent::FileMissing { id, path } => {
+                    self.pending_playback.remove(&id);
                     if id == PREVIEW_TRIM_ID {
                         self.preview_playing = false;
                         self.toast(
@@ -1690,6 +1834,7 @@ impl SoundboardApp {
                     }
                 }
                 AudioEvent::DecodeError { id, message } => {
+                    self.pending_playback.remove(&id);
                     if id == TEST_SOUND_ID {
                         self.testing = false;
                     } else if id == PREVIEW_TRIM_ID {
@@ -1702,6 +1847,18 @@ impl SoundboardApp {
                     self.toast(ToastKind::Warn, message);
                 }
                 AudioEvent::DeviceReady { actual, fallback } => {
+                    self.output_state = if actual.is_empty() {
+                        OutputState::Unavailable(
+                            fallback
+                                .clone()
+                                .unwrap_or_else(|| "No output available".into()),
+                        )
+                    } else {
+                        OutputState::Ready {
+                            actual: actual.clone(),
+                            warning: fallback.clone(),
+                        }
+                    };
                     if let Some(note) = fallback {
                         if !actual.is_empty() {
                             // Preserve the requested routing preference.
@@ -1714,6 +1871,8 @@ impl SoundboardApp {
                     }
                 }
                 AudioEvent::DeviceUnavailable { id, message } => {
+                    self.pending_playback.remove(&id);
+                    self.output_state = OutputState::Unavailable(message.clone());
                     self.playing.remove(&id);
                     if id == TEST_SOUND_ID {
                         self.testing = false;
@@ -1724,6 +1883,7 @@ impl SoundboardApp {
                     self.toast(ToastKind::Warn, message);
                 }
                 AudioEvent::StreamError(message) => {
+                    self.output_state = OutputState::Unavailable(message.clone());
                     self.playing.clear();
                     self.preview_playing = false;
                     self.testing = false;
@@ -1864,15 +2024,16 @@ impl SoundboardApp {
     }
 
     fn check_mic_timeout(&mut self) {
-        if let Some(since) = self.mic_starting {
-            if since.elapsed() > MIC_START_TIMEOUT {
-                if let Some(attempt) = &self.mic_attempt {
-                    if !attempt.is_cancelled() {
-                        attempt.cancel();
-                        self.toast(ToastKind::Warn,
-                            "Microphone is still opening; waiting for the driver. Restart the app if it never returns.");
-                    }
-                }
+        if let Some(session) = &mut self.mic_session {
+            if session.attempt.is_cancelled() {
+                session.phase = RecordingPhase::Cancelling;
+            }
+            if session.phase == RecordingPhase::Opening
+                && session.since.elapsed() > MIC_START_TIMEOUT
+            {
+                session.attempt.cancel();
+                session.phase = RecordingPhase::Cancelling;
+                self.toast(ToastKind::Warn, "Microphone is still opening; waiting for the driver. Restart if it never returns.");
             }
         }
     }
@@ -1886,13 +2047,17 @@ impl SoundboardApp {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break true,
             };
             if !self
-                .mic_attempt
+                .mic_session
                 .as_ref()
-                .is_some_and(|a| a.id == attempt_id)
+                .is_some_and(|s| s.attempt.id == attempt_id)
             {
                 continue;
             }
-            let event = if self.mic_attempt.as_ref().is_some_and(|a| a.is_cancelled()) {
+            let event = if self
+                .mic_session
+                .as_ref()
+                .is_some_and(|s| s.attempt.is_cancelled())
+            {
                 if matches!(event, RecordEvent::Started { .. }) {
                     continue;
                 }
@@ -1903,19 +2068,21 @@ impl SoundboardApp {
             } else {
                 event
             };
+            let target_board = self
+                .mic_session
+                .as_ref()
+                .map_or(self.active_board, |s| s.board);
             if !matches!(event, RecordEvent::Started { .. }) {
-                self.mic_attempt = None;
+                self.mic_session = None;
             }
             changed = true;
 
-            self.mic_starting = None;
             match event {
                 RecordEvent::Started { device } => {
-                    let board = self.mic_start_board.take().unwrap_or(self.active_board);
-                    self.mic = Some(MicTake {
-                        started: Instant::now(),
-                        board,
-                    });
+                    if let Some(session) = &mut self.mic_session {
+                        session.phase = RecordingPhase::Recording;
+                        session.since = Instant::now();
+                    }
 
                     self.toast(ToastKind::Info, format!("Recording from {device}."));
                 }
@@ -1926,14 +2093,7 @@ impl SoundboardApp {
                     dropped_chunks,
                     stream_died,
                 } => {
-                    let target_board = self
-                        .mic
-                        .as_ref()
-                        .map(|take| take.board)
-                        .unwrap_or(self.active_board);
-                    self.mic = None;
-                    self.mic_start_board = None;
-
+                    self.checkpoint();
                     let name = Self::display_name_for(&path);
                     let id = self.alloc_id();
                     let mut slot = SoundSlot::with_file(id, name.clone(), path);
@@ -1985,25 +2145,20 @@ impl SoundboardApp {
                     }
                 }
                 RecordEvent::Cancelled => {
-                    self.mic = None;
-                    self.mic_start_board = None;
+                    self.mic_session = None;
                     self.toast(
                         ToastKind::Info,
                         "Microphone attempt cancelled. You can try again.",
                     );
                 }
                 RecordEvent::Failed(message) => {
-                    self.mic = None;
-                    self.mic_start_board = None;
+                    self.mic_session = None;
                     self.toast(ToastKind::Warn, message);
                 }
             }
         };
-        if self.mic_attempt.is_some() && disconnected {
-            self.mic_attempt = None;
-            self.mic_starting = None;
-            self.mic_start_board = None;
-            self.mic = None;
+        if self.mic_session.is_some() && disconnected {
+            self.mic_session = None;
             self.toast(
                 ToastKind::Warn,
                 "The recorder stopped unexpectedly. Restart the app to record again.",
@@ -2015,8 +2170,46 @@ impl SoundboardApp {
 
     fn apply(&mut self, action: SlotAction) {
         match action {
-            SlotAction::AddViaPicker => {
-                self.add_sound_via_picker();
+            SlotAction::Rename(id) => {
+                self.rename_sound = self.find_slot_mut(id).map(|s| (id, s.name.clone()));
+            }
+            SlotAction::MoveBefore(id, target) => {
+                let source = self.active().slots.iter().position(|s| s.id == id);
+                let destination = self.active().slots.iter().position(|s| s.id == target);
+                if let (Some(source), Some(destination)) = (source, destination) {
+                    if source != destination {
+                        self.checkpoint();
+                        let slot = self.active_mut().slots.remove(source);
+                        let destination = if source < destination {
+                            destination - 1
+                        } else {
+                            destination
+                        };
+                        self.active_mut().slots.insert(destination, slot);
+                        self.mark_dirty();
+                    }
+                }
+            }
+            SlotAction::Move(id, offset) => {
+                if let Some(index) = self.active().slots.iter().position(|s| s.id == id) {
+                    let destination = (index as isize + offset)
+                        .clamp(0, self.active().slots.len() as isize - 1)
+                        as usize;
+                    if index != destination {
+                        self.checkpoint();
+                        self.active_mut().slots.swap(index, destination);
+                        self.mark_dirty();
+                    }
+                }
+            }
+            SlotAction::Volume(id, volume) => {
+                self.checkpoint();
+                if let Some(slot) = self.find_slot_mut(id) {
+                    slot.volume = volume;
+                }
+                self.send(AudioCommand::SetSlotVolume(id, volume));
+                self.push_hotkey_rebuild();
+                self.mark_dirty();
             }
             SlotAction::Play(id) => {
                 self.stop_preview();
@@ -2030,6 +2223,7 @@ impl SoundboardApp {
                             id,
                             path,
                             trim: trim_spec_for(&slot),
+                            volume: slot.volume,
                         });
                     } else {
                         self.toast(ToastKind::Info, "Pick a sound file for this slot first.");
@@ -2050,6 +2244,7 @@ impl SoundboardApp {
                 );
             }
             SlotAction::ClearHotkey(id) => {
+                self.checkpoint();
                 let old_key = self.find_slot_mut(id).and_then(|s| s.hotkey.take());
                 if let Some(old) = old_key {
                     self.notified_rejected_hotkeys.remove(&old.display());
@@ -2059,6 +2254,7 @@ impl SoundboardApp {
                 self.toast(ToastKind::Info, "Hotkey removed.");
             }
             SlotAction::Remove(id) => {
+                self.checkpoint();
                 if self.editor.as_ref().is_some_and(|editor| editor.slot == id) {
                     self.stop_preview();
                     self.editor = None;
@@ -2307,6 +2503,7 @@ impl SoundboardApp {
             }
         }
         if let Some((start, end, duration)) = save {
+            self.checkpoint();
             self.stop_preview();
             if let Some(slot) = self.find_slot_mut(slot_id) {
                 slot.trim_start = start;
@@ -2348,6 +2545,12 @@ impl SoundboardApp {
         if let Some(path) = path {
             self.send(AudioCommand::Play {
                 id: PREVIEW_TRIM_ID,
+                volume: self
+                    .boards
+                    .iter()
+                    .flat_map(|b| &b.slots)
+                    .find(|s| s.id == id)
+                    .map_or(1.0, |s| s.volume),
                 path,
                 trim: Some(TrimSpec {
                     start_frac,
@@ -2371,7 +2574,7 @@ impl SoundboardApp {
     fn display_name_for(path: &std::path::Path) -> String {
         path.file_stem()
             .and_then(|stem| stem.to_str())
-            .map(|stem| ellipsize(stem, 18))
+            .map(str::to_owned)
             .filter(|stem| !stem.is_empty())
             .unwrap_or_else(|| "Sound".to_owned())
     }
@@ -2380,6 +2583,7 @@ impl SoundboardApp {
         let Some(path) = Self::pick_sound_file() else {
             return;
         };
+        self.checkpoint();
         self.stop_preview();
         let name = Self::display_name_for(&path);
         let editor_open_for_slot = self.editor.as_ref().is_some_and(|e| e.slot == id);
@@ -2411,20 +2615,107 @@ impl SoundboardApp {
         );
     }
 
+    fn checkpoint(&mut self) {
+        if self.undo.len() == 20 {
+            self.undo.remove(0);
+        }
+        self.undo.push((self.boards.clone(), self.active_board));
+    }
+
+    fn undo_edit(&mut self) {
+        if let Some((boards, active)) = self.undo.pop() {
+            self.send(AudioCommand::StopAll);
+            self.playing.clear();
+            self.preview_playing = false;
+            self.testing = false;
+            self.editor = None;
+            self.rename_sound = None;
+            self.confirm = None;
+            self.recording = None;
+            self.boards = boards;
+            self.active_board = active;
+            self.broken.clear();
+            self.search.clear();
+            let cached: Vec<_> = self
+                .waves
+                .ready
+                .keys()
+                .chain(self.waves.pending.keys())
+                .copied()
+                .collect();
+            for id in cached {
+                self.waves.invalidate(id);
+            }
+            self.push_hotkey_rebuild();
+            self.mark_dirty();
+            self.toast(ToastKind::Info, "Last edit undone.");
+        }
+    }
+
+    fn import_sounds(&mut self, paths: Vec<PathBuf>) {
+        let paths: Vec<_> = paths
+            .into_iter()
+            .filter(|p| {
+                p.is_file()
+                    && p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                        ["mp3", "wav", "ogg", "flac", "m4a", "aac"]
+                            .contains(&e.to_lowercase().as_str())
+                    })
+            })
+            .collect();
+        if paths.is_empty() {
+            self.toast(ToastKind::Warn, "No supported audio files selected.");
+            return;
+        }
+        self.checkpoint();
+        let count = paths.len();
+        for path in paths {
+            let id = self.alloc_id();
+            let name = Self::display_name_for(&path);
+            self.active_mut()
+                .slots
+                .push(SoundSlot::with_file(id, name, path));
+        }
+        self.search.clear();
+        self.mark_dirty();
+        self.toast(ToastKind::Good, format!("Added {count} sounds."));
+    }
+
     fn add_sound_via_picker(&mut self) {
-        let Some(path) = Self::pick_sound_file() else {
+        if let Some(paths) = rfd::FileDialog::new()
+            .set_title("Choose sounds")
+            .add_filter("Audio", &["mp3", "wav", "ogg", "flac", "m4a", "aac"])
+            .pick_files()
+        {
+            self.import_sounds(paths);
+        }
+    }
+
+    fn rename_sound_dialog(&mut self, ctx: &egui::Context) {
+        let Some((id, mut name)) = self.rename_sound.clone() else {
             return;
         };
-        let name = Self::display_name_for(&path);
-        let id = self.alloc_id();
-        self.active_mut()
-            .slots
-            .push(SoundSlot::with_file(id, name.clone(), path));
-        self.mark_dirty();
-        self.toast(
-            ToastKind::Good,
-            format!("Added \"{name}\". Click ▶ to hear it."),
-        );
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new("Rename sound")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.text_edit_singleline(&mut name);
+                save = ui
+                    .add_enabled(!name.trim().is_empty(), Button::new("Save name"))
+                    .clicked();
+            });
+        if save {
+            self.checkpoint();
+            if let Some(slot) = self.find_slot_mut(id) {
+                slot.name = name.trim().into();
+            }
+            self.mark_dirty();
+            self.rename_sound = None;
+        } else {
+            self.rename_sound = open.then_some((id, name));
+        }
     }
 
     fn schedule_repaint(&self, ctx: &egui::Context) {
@@ -2432,7 +2723,11 @@ impl SoundboardApp {
             ctx.request_repaint_after(TILE_ANIMATION_FRAME);
         }
 
-        if self.mic.is_some() {
+        if self
+            .mic_session
+            .as_ref()
+            .is_some_and(|s| s.phase == RecordingPhase::Recording)
+        {
             ctx.request_repaint_after(TIMER_FRAME);
         }
 
@@ -2443,12 +2738,12 @@ impl SoundboardApp {
             }
         }
 
-        if let Some(since) = self
-            .mic_starting
-            .filter(|_| !self.mic_attempt.as_ref().is_some_and(|a| a.is_cancelled()))
+        if let Some(session) = self
+            .mic_session
+            .as_ref()
+            .filter(|s| s.phase == RecordingPhase::Opening)
         {
-            let remaining = MIC_START_TIMEOUT.saturating_sub(since.elapsed());
-            ctx.request_repaint_after(remaining);
+            ctx.request_repaint_after(MIC_START_TIMEOUT.saturating_sub(session.since.elapsed()));
         }
 
         if self.config_dirty && !self.read_only && !self.save_in_flight {
@@ -2467,10 +2762,14 @@ impl eframe::App for SoundboardApp {
         let mut actions: Vec<SlotAction> = Vec::new();
 
         self.top_bar(ui);
-        self.toolbar(ui);
         self.status_bar(ui);
+        self.master_controls(ui);
+        self.navigation(ui);
+        self.toolbar(ui);
         self.grid(ui, &mut actions);
         self.settings_window(&ctx);
+        self.recorder_window(&ctx);
+        self.rename_sound_dialog(&ctx);
         self.confirm_dialog(&ctx);
         self.board_dialogs(&ctx);
         self.editor_dialog(&ctx);
@@ -2481,6 +2780,16 @@ impl eframe::App for SoundboardApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let dropped = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        if !dropped.is_empty() {
+            self.import_sounds(dropped);
+        }
         self.poll_audio_events();
         if self.poll_hotkey_events() {
             ctx.request_repaint();
@@ -2503,6 +2812,7 @@ impl eframe::App for SoundboardApp {
             ctx.request_repaint();
         }
 
+        self.poll_bundle();
         self.check_mic_timeout();
 
         self.handle_tray(ctx);
@@ -2642,10 +2952,11 @@ fn draw_slot(
     playing: bool,
     recording: bool,
     hotkey_rejected: bool,
+    width: f32,
 ) -> Option<SlotAction> {
     let mut action: Option<SlotAction> = None;
 
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(SLOT_W, SLOT_H), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, SLOT_H), Sense::hover());
 
     let (fill, stroke) = slot_colors(ui, slot, playing, recording);
     ui.painter().rect(
@@ -2664,27 +2975,38 @@ fn draw_slot(
             .layout(Layout::top_down(Align::Min)),
         |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(ellipsize(&slot.name, 14))
-                        .size(14.5)
-                        .strong()
-                        .color(theme::TEXT),
-                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .small_button(RichText::new("✕").color(theme::MUTED))
-                        .on_hover_text("Remove this sound")
-                        .clicked()
-                    {
-                        action = Some(SlotAction::Remove(slot.id));
-                    }
-                    if ui
-                        .small_button(RichText::new("✎").color(theme::MUTED))
-                        .on_hover_text("Trim this sound")
-                        .clicked()
-                    {
-                        action = Some(SlotAction::Edit(slot.id));
-                    }
+                    let drag = ui
+                        .add(egui::Label::new("⠿").sense(Sense::drag()))
+                        .on_hover_text("Drag to reorder");
+                    drag.dnd_set_drag_payload(slot.id);
+                    ui.menu_button("…", |ui| {
+                        let mut gain = slot.volume;
+                        if ui
+                            .add(egui::Slider::new(&mut gain, 0.0..=1.0).text("Volume"))
+                            .changed()
+                        {
+                            action = Some(SlotAction::Volume(slot.id, gain));
+                        }
+                        for (label, next) in [
+                            ("Rename", SlotAction::Rename(slot.id)),
+                            ("Move earlier", SlotAction::Move(slot.id, -1)),
+                            ("Move later", SlotAction::Move(slot.id, 1)),
+                            ("Trim sound", SlotAction::Edit(slot.id)),
+                            ("Replace file", SlotAction::FindAgain(slot.id)),
+                            ("Clear hotkey", SlotAction::ClearHotkey(slot.id)),
+                            ("Remove sound", SlotAction::Remove(slot.id)),
+                        ] {
+                            if ui.button(label).clicked() {
+                                action = Some(next);
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.add(
+                        egui::Label::new(RichText::new(&slot.name).size(15.0).strong()).truncate(),
+                    )
+                    .on_hover_text(&slot.name);
                 });
             });
 
@@ -2708,7 +3030,7 @@ fn draw_slot(
                     action = Some(SlotAction::FindAgain(slot.id));
                 }
             } else {
-                let label = if playing { "⏹   Stop" } else { "▶   Play" };
+                let label = if playing { "■ Stop" } else { "▶   Play" };
                 let fill = if playing {
                     theme::GOOD_SOFT
                 } else {
@@ -2744,7 +3066,11 @@ fn draw_slot(
         },
     );
 
-    response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if let Some(source) = response.dnd_release_payload::<SlotId>() {
+        if *source != slot.id {
+            action = Some(SlotAction::MoveBefore(*source, slot.id));
+        }
+    }
 
     action
 }
@@ -2806,35 +3132,6 @@ fn hotkey_badge(
     }
 }
 
-fn draw_add_tile(ui: &mut egui::Ui, actions: &mut Vec<SlotAction>) {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(SLOT_W, SLOT_H), Sense::click());
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(14),
-        Color32::TRANSPARENT,
-        Stroke::new(1.5, theme::BORDER),
-        egui::StrokeKind::Inside,
-    );
-
-    let inner = rect.shrink(SLOT_PAD);
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(inner)
-            .layout(Layout::top_down(Align::Center)),
-        |ui| {
-            ui.add_space(26.0);
-            ui.label(RichText::new("➕").size(26.0).color(theme::ACCENT));
-            ui.add_space(2.0);
-            ui.label(RichText::new("Add Sound").size(13.0).color(theme::MUTED));
-        },
-    );
-
-    if response.clicked() {
-        actions.push(SlotAction::AddViaPicker);
-    }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand);
-}
-
 fn slot_colors(
     ui: &egui::Ui,
     slot: &SoundSlot,
@@ -2881,6 +3178,15 @@ fn ellipsize(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn test_session(id: u64) -> RecordingSession {
+        RecordingSession {
+            attempt: RecordAttempt::new(id),
+            board: 1,
+            since: Instant::now(),
+            phase: RecordingPhase::Opening,
+        }
+    }
+
     fn test_app() -> SoundboardApp {
         let ctx = egui::Context::default();
         let boards = vec![Board::empty(1, "Test")];
@@ -2921,11 +3227,8 @@ mod tests {
             hotkey_state: HotkeyBackendState::Starting,
             record_tx,
             record_rx,
-            mic: None,
-            mic_starting: None,
-            mic_attempt: None,
+            mic_session: None,
             next_mic_attempt: 1,
-            mic_start_board: None,
             mic_devices,
             mic_device,
             stop_hotkey,
@@ -2942,6 +3245,7 @@ mod tests {
             next_slot_id,
             recording: None,
             playing: HashSet::new(),
+            pending_playback: HashSet::new(),
             preview_playing: false,
             testing: false,
             confirm: None,
@@ -2954,8 +3258,109 @@ mod tests {
             tray: None,
             close_to_tray,
             settings_open: false,
+            recorder_open: false,
+            search: String::new(),
+            rename_sound: None,
+            undo: Vec::new(),
+            bundle_job: None,
+            output_state: OutputState::Opening,
             quit_requested: false,
             window_visible: true,
+        }
+    }
+
+    #[test]
+    fn reorder_remove_and_undo_preserve_ids_and_settings() {
+        let mut app = test_app();
+        app.boards[0].slots = vec![
+            SoundSlot::with_file(10, "First", "/one.wav"),
+            SoundSlot::with_file(11, "Second", "/two.wav"),
+        ];
+        app.apply(SlotAction::Move(11, -1));
+        assert_eq!(app.active().slots[0].id, 11);
+        app.apply(SlotAction::Volume(11, 0.25));
+        app.apply(SlotAction::Remove(11));
+        app.undo_edit();
+        assert_eq!(app.active().slots[0].id, 11);
+        assert_eq!(app.active().slots[0].volume, 0.25);
+        app.undo_edit();
+        assert_eq!(app.active().slots[0].volume, 1.0);
+        app.undo_edit();
+        assert_eq!(app.active().slots[0].id, 10);
+    }
+
+    #[test]
+    fn recording_completion_keeps_original_board_in_finishing_phase() {
+        let mut app = test_app();
+        app.boards.push(Board::empty(2, "Other"));
+        app.active_board = 2;
+        app.mic_session = Some(RecordingSession {
+            phase: RecordingPhase::Finishing,
+            ..test_session(7)
+        });
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.record_rx = rx;
+        tx.send(RecordMessage {
+            attempt_id: 7,
+            event: RecordEvent::Saved {
+                path: "/take.wav".into(),
+                duration_secs: 1.0,
+                capped: false,
+                dropped_chunks: 0,
+                stream_died: false,
+            },
+        })
+        .unwrap();
+        app.poll_record_events();
+        assert_eq!(app.boards[0].slots.len(), 1);
+        assert!(app.boards[1].slots.is_empty());
+        assert!(app.mic_session.is_none());
+    }
+
+    #[test]
+    fn responsive_layout_renders_with_search_recording_and_output_warning() {
+        for size in [
+            egui::vec2(620.0, 460.0),
+            egui::vec2(820.0, 620.0),
+            egui::vec2(1200.0, 800.0),
+        ] {
+            let mut app = test_app();
+            let ctx = app.ctx.clone();
+            theme::apply(&ctx);
+            app.boards[0].slots.push(SoundSlot::with_file(
+                1,
+                "A long sound name for layout validation",
+                "/test.wav",
+            ));
+            app.output_state = OutputState::Ready {
+                actual: "Speakers".into(),
+                warning: Some("Using default output".into()),
+            };
+            app.recorder_open = true;
+            app.mic_session = Some(test_session(1));
+            app.mic_session.as_mut().unwrap().phase = RecordingPhase::Recording;
+            for query in ["", "no matches"] {
+                app.search = query.into();
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.top_bar(ui);
+                        app.status_bar(ui);
+                        app.master_controls(ui);
+                        app.navigation(ui);
+                        app.toolbar(ui);
+                        assert!(ui.available_width() > 300.0);
+                        assert!(ui.available_height() > 80.0);
+                        app.grid(ui, &mut vec![]);
+                        app.recorder_window(&ctx);
+                    },
+                );
+                assert!(!output.shapes.is_empty());
+                output.textures_delta.clear();
+            }
         }
     }
 
@@ -2964,14 +3369,15 @@ mod tests {
         let mut app = test_app();
         let (tx, _rx) = crossbeam_channel::unbounded();
         app.record_tx = tx.clone();
-        app.mic_attempt = Some(RecordAttempt::new(3));
-        app.mic_starting = Some(Instant::now() - MIC_START_TIMEOUT - Duration::from_secs(1));
+        app.mic_session = Some(test_session(3));
+        app.mic_session.as_mut().unwrap().since =
+            Instant::now() - MIC_START_TIMEOUT - Duration::from_secs(1);
         for _ in 0..10 {
             app.check_mic_timeout();
         }
         assert!(app.record_tx.same_channel(&tx));
-        assert!(app.mic_attempt.as_ref().unwrap().is_cancelled());
-        assert!(app.mic_starting.is_some());
+        assert!(app.mic_session.as_ref().unwrap().attempt.is_cancelled());
+        assert!(app.mic_session.is_some());
         assert_eq!(app.next_mic_attempt, 1);
     }
 
@@ -3022,11 +3428,11 @@ mod tests {
     #[test]
     fn recorder_disconnect_clears_startup_state() {
         let mut app = test_app();
-        app.mic_attempt = Some(RecordAttempt::new(1));
-        app.mic_starting = Some(Instant::now());
+        app.mic_session = Some(test_session(1));
+
         assert!(app.poll_record_events());
-        assert!(app.mic_attempt.is_none());
-        assert!(app.mic_starting.is_none());
+        assert!(app.mic_session.is_none());
+        assert!(app.mic_session.is_none());
     }
 
     #[test]
@@ -3034,7 +3440,10 @@ mod tests {
         let mut app = test_app();
         let attempt = RecordAttempt::new(3);
         attempt.cancel();
-        app.mic_attempt = Some(attempt);
+        app.mic_session = Some(RecordingSession {
+            attempt,
+            ..test_session(1)
+        });
         let path = std::env::temp_dir().join(format!("cancelled-take-{}.wav", std::process::id()));
         std::fs::write(&path, b"cancelled take").unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -3053,7 +3462,7 @@ mod tests {
         app.poll_record_events();
         assert!(!path.exists());
         assert!(app.boards[0].slots.is_empty());
-        assert!(app.mic_attempt.is_none());
+        assert!(app.mic_session.is_none());
     }
 
     #[test]
@@ -3126,8 +3535,11 @@ mod tests {
         let mut app = test_app();
         let attempt = RecordAttempt::new(2);
         attempt.cancel();
-        app.mic_attempt = Some(attempt);
-        app.mic_starting = Some(Instant::now());
+        app.mic_session = Some(RecordingSession {
+            attempt,
+            ..test_session(1)
+        });
+
         let (tx, rx) = crossbeam_channel::unbounded();
         app.record_rx = rx;
         for attempt_id in [1, 2] {
@@ -3140,16 +3552,19 @@ mod tests {
             .unwrap();
         }
         app.poll_record_events();
-        assert!(app.mic.is_none());
-        assert!(app.mic_starting.is_some());
+        assert!(!app
+            .mic_session
+            .as_ref()
+            .is_some_and(|s| s.phase == RecordingPhase::Recording));
+        assert!(app.mic_session.is_some());
         tx.send(RecordMessage {
             attempt_id: 2,
             event: RecordEvent::Cancelled,
         })
         .unwrap();
         app.poll_record_events();
-        assert!(app.mic_attempt.is_none());
-        assert!(app.mic_starting.is_none());
+        assert!(app.mic_session.is_none());
+        assert!(app.mic_session.is_none());
     }
 
     #[test]

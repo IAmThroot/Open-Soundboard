@@ -37,6 +37,7 @@ fn death_reason(reason: &DeathReason) -> Option<String> {
 #[derive(Clone, Debug)]
 pub struct RecordAttempt {
     pub id: u64,
+    peak: Arc<std::sync::atomic::AtomicU32>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -44,8 +45,12 @@ impl RecordAttempt {
     pub fn new(id: u64) -> Self {
         Self {
             id,
+            peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+    pub fn level(&self) -> f32 {
+        f32::from_bits(self.peak.load(std::sync::atomic::Ordering::Relaxed)).clamp(0.0, 1.0)
     }
     pub fn cancel(&self) {
         self.cancelled
@@ -313,9 +318,14 @@ fn record_once(
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
             let (tx, dropped) = (chunk_tx, dropped.clone());
+            let peak = attempt.peak.clone();
             device.build_input_stream(
                 config.config(),
                 move |data: &[f32], _| {
+                    peak.store(
+                        data.iter().fold(0.0_f32, |p, s| p.max(s.abs())).to_bits(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if tx.try_send(data.to_vec()).is_err() {
                         dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -326,10 +336,18 @@ fn record_once(
         }
         cpal::SampleFormat::I16 => {
             let (tx, dropped) = (chunk_tx, dropped.clone());
+            let peak = attempt.peak.clone();
             device.build_input_stream(
                 config.config(),
                 move |data: &[i16], _| {
                     let converted: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+                    peak.store(
+                        converted
+                            .iter()
+                            .fold(0.0_f32, |p, s| p.max(s.abs()))
+                            .to_bits(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if tx.try_send(converted).is_err() {
                         dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -340,6 +358,7 @@ fn record_once(
         }
         cpal::SampleFormat::U16 => {
             let (tx, dropped) = (chunk_tx, dropped.clone());
+            let peak = attempt.peak.clone();
             device.build_input_stream(
                 config.config(),
                 move |data: &[u16], _| {
@@ -347,6 +366,13 @@ fn record_once(
                         .iter()
                         .map(|&s| (s as f32 - 32768.0) / 32768.0)
                         .collect();
+                    peak.store(
+                        converted
+                            .iter()
+                            .fold(0.0_f32, |p, s| p.max(s.abs()))
+                            .to_bits(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if tx.try_send(converted).is_err() {
                         dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }

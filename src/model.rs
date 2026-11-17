@@ -99,6 +99,9 @@ pub struct SoundSlot {
 
     pub name: String,
 
+    #[serde(default = "default_trim_end")]
+    pub volume: f32,
+
     #[serde(default)]
     pub file_path: Option<PathBuf>,
     #[serde(default)]
@@ -135,6 +138,7 @@ impl SoundSlot {
         Self {
             id,
             name: name.into(),
+            volume: 1.0,
             file_path: Some(path.into()),
             hotkey: None,
             missing: false,
@@ -148,6 +152,16 @@ impl SoundSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_sound_defaults_to_full_volume() {
+        let slot: SoundSlot = serde_json::from_str(r#"{"id":1,"name":"Old sound"}"#).unwrap();
+        assert_eq!(slot.volume, 1.0);
+        let mut slot = slot;
+        slot.volume = 0.35;
+        let back: SoundSlot = serde_json::from_str(&serde_json::to_string(&slot).unwrap()).unwrap();
+        assert_eq!(back.volume, 0.35);
+    }
 
     #[test]
     fn badge_renders_modifiers_in_readable_order() {
